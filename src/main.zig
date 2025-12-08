@@ -39,14 +39,25 @@ pub fn main() !void {
             std.debug.print("Error: 'run' command requires a file path\n", .{});
             return;
         }
-        try runFile(allocator, args[2]);
+        // Check for --fixpoint or -f flag
+        var use_fixpoint = false;
+        var file_path: []const u8 = args[2];
+        if (args.len >= 4) {
+            if (std.mem.eql(u8, args[2], "--fixpoint") or std.mem.eql(u8, args[2], "-f")) {
+                use_fixpoint = true;
+                file_path = args[3];
+            } else if (std.mem.eql(u8, args[3], "--fixpoint") or std.mem.eql(u8, args[3], "-f")) {
+                use_fixpoint = true;
+            }
+        }
+        try runFile(allocator, file_path, use_fixpoint);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         try printVersion();
     } else {
         // Assume it's a file path
-        try runFile(allocator, command);
+        try runFile(allocator, command, false);
     }
 }
 
@@ -61,16 +72,21 @@ fn printUsage() !void {
         \\Usage: tlc <command> [options] [file]
         \\
         \\Commands:
-        \\  lex <file>      Tokenize a .tl file and print tokens
-        \\  parse <file>    Parse a .tl file and print AST summary
-        \\  run <file>      Execute a .tl program
-        \\  help            Show this help message
-        \\  version         Show version information
+        \\  lex <file>           Tokenize a .tl file and print tokens
+        \\  parse <file>         Parse a .tl file and print AST summary
+        \\  run <file>           Execute a .tl program (single pass)
+        \\  run -f <file>        Execute with fixpoint iteration (for recursive rules)
+        \\  help                 Show this help message
+        \\  version              Show version information
+        \\
+        \\Options:
+        \\  -f, --fixpoint       Run until convergence (for recursive rules like Ancestor)
         \\
         \\Examples:
         \\  tlc lex examples/matmul.tl
         \\  tlc parse examples/ancestor.tl
-        \\  tlc run examples/ancestor.tl
+        \\  tlc run examples/matmul.tl
+        \\  tlc run -f examples/ancestor.tl
         \\
     );
 }
@@ -181,7 +197,7 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 }
 
-fn runFile(allocator: std.mem.Allocator, path: []const u8) !void {
+fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool) !void {
     const stdout = std.fs.File.stdout();
 
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
@@ -217,16 +233,33 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8) !void {
     var interp = interpreter.Interpreter.init(allocator);
     defer interp.deinit();
 
-    const msg1 = std.fmt.allocPrint(allocator, "Running {s}...\n", .{path}) catch return;
-    defer allocator.free(msg1);
-    stdout.writeAll(msg1) catch return;
+    if (use_fixpoint) {
+        const msg1 = std.fmt.allocPrint(allocator, "Running {s} with fixpoint iteration...\n", .{path}) catch return;
+        defer allocator.free(msg1);
+        stdout.writeAll(msg1) catch return;
 
-    interp.execute(&program) catch |err| {
-        const err_msg = std.fmt.allocPrint(allocator, "Runtime error: {}\n", .{err}) catch return;
-        defer allocator.free(err_msg);
-        stdout.writeAll(err_msg) catch return;
-        return;
-    };
+        const iters = interp.executeToFixpoint(&program) catch |err| {
+            const err_msg = std.fmt.allocPrint(allocator, "Runtime error: {}\n", .{err}) catch return;
+            defer allocator.free(err_msg);
+            stdout.writeAll(err_msg) catch return;
+            return;
+        };
+
+        const msg2 = std.fmt.allocPrint(allocator, "Converged after {d} iteration(s)\n", .{iters}) catch return;
+        defer allocator.free(msg2);
+        stdout.writeAll(msg2) catch return;
+    } else {
+        const msg1 = std.fmt.allocPrint(allocator, "Running {s}...\n", .{path}) catch return;
+        defer allocator.free(msg1);
+        stdout.writeAll(msg1) catch return;
+
+        interp.execute(&program) catch |err| {
+            const err_msg = std.fmt.allocPrint(allocator, "Runtime error: {}\n", .{err}) catch return;
+            defer allocator.free(err_msg);
+            stdout.writeAll(err_msg) catch return;
+            return;
+        };
+    }
 
     // Print results
     stdout.writeAll("\nDefined tensors:\n") catch return;
@@ -255,6 +288,55 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8) !void {
         }) catch continue;
         defer allocator.free(line);
         stdout.writeAll(line) catch continue;
+
+        // For small tensors, print non-zero values
+        if (shape.numel() <= 100) {
+            switch (t) {
+                .f64_dense => |dense| {
+                    // Print non-zero elements
+                    var has_nonzero = false;
+                    for (dense.data, 0..) |val, flat_idx| {
+                        if (val != 0.0) {
+                            if (!has_nonzero) {
+                                stdout.writeAll("    Non-zero values:\n") catch continue;
+                                has_nonzero = true;
+                            }
+                            // Convert flat index to multi-index
+                            var idx_str = std.ArrayListUnmanaged(u8){};
+                            defer idx_str.deinit(allocator);
+                            var idx_writer = idx_str.writer(allocator);
+
+                            var remaining = flat_idx;
+                            var strides = std.ArrayListUnmanaged(usize){};
+                            defer strides.deinit(allocator);
+
+                            // Compute strides
+                            var stride: usize = 1;
+                            var dim_idx = shape.dims.len;
+                            while (dim_idx > 0) {
+                                dim_idx -= 1;
+                                strides.insert(allocator, 0, stride) catch break;
+                                stride *= shape.dims[dim_idx];
+                            }
+
+                            idx_writer.print("[", .{}) catch continue;
+                            for (strides.items, 0..) |s, di| {
+                                if (di > 0) idx_writer.print(",", .{}) catch continue;
+                                const coord = remaining / s;
+                                remaining = remaining % s;
+                                idx_writer.print("{d}", .{coord}) catch continue;
+                            }
+                            idx_writer.print("]", .{}) catch continue;
+
+                            const val_line = std.fmt.allocPrint(allocator, "      {s} = {d:.1}\n", .{ idx_str.items, val }) catch continue;
+                            defer allocator.free(val_line);
+                            stdout.writeAll(val_line) catch continue;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     stdout.writeAll("\nExecution complete.\n") catch return;

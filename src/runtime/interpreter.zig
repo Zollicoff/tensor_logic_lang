@@ -158,6 +158,29 @@ pub const Interpreter = struct {
 
     /// Execute a tensor equation
     fn executeEquation(self: *Interpreter, eq: *const ast.Equation) !void {
+        // Check if this is an element-wise assignment (all constant indices)
+        var all_constant = true;
+        var element_indices = std.ArrayListUnmanaged(usize){};
+        defer element_indices.deinit(self.allocator);
+
+        for (eq.lhs.indices) |idx| {
+            switch (idx) {
+                .constant => |c| {
+                    element_indices.append(self.allocator, @intCast(c)) catch return InterpreterError.OutOfMemory;
+                },
+                else => {
+                    all_constant = false;
+                    break;
+                },
+            }
+        }
+
+        if (all_constant and element_indices.items.len > 0) {
+            // Element-wise assignment: T[0,1] = value
+            return self.executeElementAssignment(eq, element_indices.items);
+        }
+
+        // Regular tensor equation
         // Determine output shape from LHS indices
         var shape = std.ArrayListUnmanaged(usize){};
         defer shape.deinit(self.allocator);
@@ -256,16 +279,136 @@ pub const Interpreter = struct {
             },
             .max => {
                 // Take element-wise max
-                // TODO: implement
+                switch (lhs_tensor.*) {
+                    .f64_dense => |*t| {
+                        switch (rhs_val) {
+                            .tensor_val => |rv| {
+                                if (rv == .f64_dense) {
+                                    for (t.data, rv.f64_dense.data) |*a, b| {
+                                        a.* = @max(a.*, b);
+                                    }
+                                }
+                            },
+                            .f64_val => |v| {
+                                for (t.data) |*x| {
+                                    x.* = @max(x.*, v);
+                                }
+                            },
+                            .i64_val => |v| {
+                                const fv: f64 = @floatFromInt(v);
+                                for (t.data) |*x| {
+                                    x.* = @max(x.*, fv);
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
             },
             .min => {
                 // Take element-wise min
-                // TODO: implement
+                switch (lhs_tensor.*) {
+                    .f64_dense => |*t| {
+                        switch (rhs_val) {
+                            .tensor_val => |rv| {
+                                if (rv == .f64_dense) {
+                                    for (t.data, rv.f64_dense.data) |*a, b| {
+                                        a.* = @min(a.*, b);
+                                    }
+                                }
+                            },
+                            .f64_val => |v| {
+                                for (t.data) |*x| {
+                                    x.* = @min(x.*, v);
+                                }
+                            },
+                            .i64_val => |v| {
+                                const fv: f64 = @floatFromInt(v);
+                                for (t.data) |*x| {
+                                    x.* = @min(x.*, fv);
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
             },
             .avg => {
                 // Running average
                 // TODO: implement
             },
+        }
+    }
+
+    /// Execute element-wise assignment: T[0,1] = value
+    fn executeElementAssignment(self: *Interpreter, eq: *const ast.Equation, indices: []const usize) !void {
+        // Ensure tensor exists with shape that accommodates the indices
+        if (self.tensors.getPtr(eq.lhs.name) == null) {
+            // Create tensor with shape large enough for these indices
+            var shape = std.ArrayListUnmanaged(usize){};
+            defer shape.deinit(self.allocator);
+            for (indices) |idx| {
+                shape.append(self.allocator, idx + 1) catch return InterpreterError.OutOfMemory;
+            }
+            try self.defineTensor(eq.lhs.name, shape.items, eq.lhs.is_boolean);
+        }
+
+        // Get the tensor
+        const lhs_tensor = self.tensors.getPtr(eq.lhs.name) orelse return InterpreterError.UndefinedTensor;
+
+        // Check if indices are within bounds, resize if needed
+        const t_shape = lhs_tensor.shape();
+        var need_resize = false;
+        for (indices, 0..) |idx, dim| {
+            if (dim >= t_shape.dims.len or idx >= t_shape.dims[dim]) {
+                need_resize = true;
+                break;
+            }
+        }
+
+        if (need_resize) {
+            // For now, return error - proper resize would need more work
+            // In a full implementation, we'd resize the tensor
+            return InterpreterError.InvalidIndex;
+        }
+
+        // Evaluate RHS (should be a scalar)
+        var rhs_val = try self.evaluateExprWithIndices(eq.rhs, &[_][]const u8{});
+        defer rhs_val.deinit();
+
+        // Get scalar value
+        const scalar: f64 = switch (rhs_val) {
+            .f64_val => |v| v,
+            .i64_val => |v| @floatFromInt(v),
+            .bool_val => |v| if (v) 1.0 else 0.0,
+            .tensor_val => return InterpreterError.ShapeMismatch, // Can't assign tensor to element
+        };
+
+        // Set the element
+        switch (lhs_tensor.*) {
+            .f64_dense => |*dense| {
+                switch (eq.op) {
+                    .assign => dense.set(indices, scalar),
+                    .add => {
+                        const old = dense.get(indices);
+                        dense.set(indices, old + scalar);
+                    },
+                    .max => {
+                        const old = dense.get(indices);
+                        dense.set(indices, @max(old, scalar));
+                    },
+                    .min => {
+                        const old = dense.get(indices);
+                        dense.set(indices, @min(old, scalar));
+                    },
+                    .avg => {
+                        // For avg, we'd need a count - skip for now
+                    },
+                }
+            },
+            else => return InterpreterError.NotImplemented,
         }
     }
 
@@ -521,14 +664,52 @@ pub const Interpreter = struct {
     }
 
     /// Run fixpoint iteration for recursive rules
-    /// Continues until tensors stop changing
+    /// Continues until tensors stop changing or max_iters reached
+    /// Returns the number of iterations performed
     pub fn runFixpoint(self: *Interpreter, program: *const ast.Program, max_iters: usize) !usize {
         var iter: usize = 0;
+
         while (iter < max_iters) : (iter += 1) {
-            // TODO: check for convergence
+            // Save current state checksums
+            const old_checksum = self.computeStateChecksum();
+
+            // Execute one iteration
             try self.execute(program);
+
+            // Check for convergence
+            const new_checksum = self.computeStateChecksum();
+            if (old_checksum == new_checksum) {
+                // Converged - no changes this iteration
+                return iter + 1;
+            }
         }
-        return iter;
+
+        return max_iters; // Did not converge within limit
+    }
+
+    /// Compute a checksum of all tensor values for convergence detection
+    fn computeStateChecksum(self: *Interpreter) u64 {
+        var checksum: u64 = 0;
+        var iter = self.tensors.iterator();
+        while (iter.next()) |entry| {
+            const t = entry.value_ptr.*;
+            switch (t) {
+                .f64_dense => |dense| {
+                    for (dense.data) |val| {
+                        // Hash the float bits
+                        const bits: u64 = @bitCast(val);
+                        checksum = checksum *% 31 +% bits;
+                    }
+                },
+                else => {},
+            }
+        }
+        return checksum;
+    }
+
+    /// Execute program until fixpoint, with default max iterations
+    pub fn executeToFixpoint(self: *Interpreter, program: *const ast.Program) !usize {
+        return self.runFixpoint(program, 100);
     }
 };
 
