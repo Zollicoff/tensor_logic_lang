@@ -541,7 +541,15 @@ pub const Interpreter = struct {
                                     .step => einsum.stepTensor(dense),
                                     .relu => einsum.reluTensor(dense),
                                     .sigmoid => einsum.sigmoidTensor(dense),
-                                    else => {},
+                                    .softmax => einsum.softmaxTensor(dense),
+                                    .tanh => einsum.tanhTensor(dense),
+                                    .exp => einsum.expTensor(dense),
+                                    .log => einsum.logTensor(dense),
+                                    .abs => einsum.absTensor(dense),
+                                    .sqrt => einsum.sqrtTensor(dense),
+                                    .sin => einsum.sinTensor(dense),
+                                    .cos => einsum.cosTensor(dense),
+                                    .norm => {}, // TODO: implement norm
                                 }
                             },
                             else => {},
@@ -552,7 +560,14 @@ pub const Interpreter = struct {
                             .step => einsum.step(v.*),
                             .relu => einsum.relu(v.*),
                             .sigmoid => einsum.sigmoid(v.*),
-                            else => v.*,
+                            .tanh => einsum.tanh_fn(v.*),
+                            .exp => einsum.exp_fn(v.*),
+                            .log => einsum.log_fn(v.*),
+                            .abs => einsum.abs_fn(v.*),
+                            .sqrt => einsum.sqrt_fn(v.*),
+                            .sin => einsum.sin_fn(v.*),
+                            .cos => einsum.cos_fn(v.*),
+                            .softmax, .norm => v.*, // No-op for scalars
                         };
                     },
                     else => {},

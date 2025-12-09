@@ -298,25 +298,140 @@ pub fn softmax(allocator: std.mem.Allocator, t: *DenseTensor(f64)) !void {
     _ = allocator;
     // For 1D tensor, softmax is straightforward
     if (t.shape.rank() == 1) {
-        // Find max for numerical stability
-        var max_val: f64 = t.data[0];
-        for (t.data) |x| {
-            if (x > max_val) max_val = x;
-        }
-
-        // Compute exp(x - max) and sum
-        var sum: f64 = 0.0;
-        for (t.data) |*x| {
-            x.* = @exp(x.* - max_val);
-            sum += x.*;
-        }
-
-        // Normalize
-        for (t.data) |*x| {
-            x.* /= sum;
+        softmax1D(t.data);
+    } else if (t.shape.rank() == 2) {
+        // For 2D tensor, apply softmax over last dimension (each row)
+        const rows = t.shape.dims[0];
+        const cols = t.shape.dims[1];
+        for (0..rows) |i| {
+            const start = i * cols;
+            const end = start + cols;
+            softmax1D(t.data[start..end]);
         }
     }
     // TODO: handle higher-rank tensors
+}
+
+/// Apply softmax to a 1D slice
+fn softmax1D(data: []f64) void {
+    if (data.len == 0) return;
+
+    // Find max for numerical stability
+    var max_val: f64 = data[0];
+    for (data) |x| {
+        if (x > max_val) max_val = x;
+    }
+
+    // Compute exp(x - max) and sum
+    var sum: f64 = 0.0;
+    for (data) |*x| {
+        x.* = @exp(x.* - max_val);
+        sum += x.*;
+    }
+
+    // Normalize
+    for (data) |*x| {
+        x.* /= sum;
+    }
+}
+
+/// Apply softmax to tensor (convenience wrapper)
+pub fn softmaxTensor(t: *DenseTensor(f64)) void {
+    if (t.shape.rank() == 1) {
+        softmax1D(t.data);
+    } else if (t.shape.rank() == 2) {
+        const rows = t.shape.dims[0];
+        const cols = t.shape.dims[1];
+        for (0..rows) |i| {
+            const start = i * cols;
+            const end = start + cols;
+            softmax1D(t.data[start..end]);
+        }
+    }
+}
+
+/// Tanh: (e^x - e^-x) / (e^x + e^-x)
+pub fn tanh_fn(x: f64) f64 {
+    return std.math.tanh(x);
+}
+
+/// Apply tanh element-wise
+pub fn tanhTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = tanh_fn(x.*);
+    }
+}
+
+/// Exponential: e^x
+pub fn exp_fn(x: f64) f64 {
+    return @exp(x);
+}
+
+/// Apply exp element-wise
+pub fn expTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = exp_fn(x.*);
+    }
+}
+
+/// Natural logarithm: ln(x)
+pub fn log_fn(x: f64) f64 {
+    return @log(x);
+}
+
+/// Apply log element-wise
+pub fn logTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = log_fn(x.*);
+    }
+}
+
+/// Absolute value: |x|
+pub fn abs_fn(x: f64) f64 {
+    return @abs(x);
+}
+
+/// Apply abs element-wise
+pub fn absTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = abs_fn(x.*);
+    }
+}
+
+/// Square root: sqrt(x)
+pub fn sqrt_fn(x: f64) f64 {
+    return @sqrt(x);
+}
+
+/// Apply sqrt element-wise
+pub fn sqrtTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = sqrt_fn(x.*);
+    }
+}
+
+/// Sine: sin(x)
+pub fn sin_fn(x: f64) f64 {
+    return @sin(x);
+}
+
+/// Apply sin element-wise
+pub fn sinTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = sin_fn(x.*);
+    }
+}
+
+/// Cosine: cos(x)
+pub fn cos_fn(x: f64) f64 {
+    return @cos(x);
+}
+
+/// Apply cos element-wise
+pub fn cosTensor(t: *DenseTensor(f64)) void {
+    for (t.data) |*x| {
+        x.* = cos_fn(x.*);
+    }
 }
 
 // ============================================================================
@@ -376,4 +491,79 @@ test "sigmoid function" {
     try std.testing.expect(sigmoid(10.0) > 0.99);
     // sigmoid approaches 0 for large negative
     try std.testing.expect(sigmoid(-10.0) < 0.01);
+}
+
+test "tanh function" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), tanh_fn(0.0), 0.0001);
+    try std.testing.expect(tanh_fn(10.0) > 0.99);
+    try std.testing.expect(tanh_fn(-10.0) < -0.99);
+}
+
+test "exp function" {
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), exp_fn(0.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.71828), exp_fn(1.0), 0.001);
+}
+
+test "log function" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), log_fn(1.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), log_fn(2.71828), 0.001);
+}
+
+test "abs function" {
+    try std.testing.expectEqual(@as(f64, 5.0), abs_fn(-5.0));
+    try std.testing.expectEqual(@as(f64, 5.0), abs_fn(5.0));
+    try std.testing.expectEqual(@as(f64, 0.0), abs_fn(0.0));
+}
+
+test "sqrt function" {
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), sqrt_fn(4.0), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), sqrt_fn(9.0), 0.0001);
+}
+
+test "softmax 1D" {
+    const allocator = std.testing.allocator;
+
+    var t = try DenseTensor(f64).init(allocator, &[_]usize{3});
+    defer t.deinit();
+    t.data[0] = 1.0;
+    t.data[1] = 2.0;
+    t.data[2] = 3.0;
+
+    softmaxTensor(&t);
+
+    // Sum should be 1.0
+    var sum: f64 = 0.0;
+    for (t.data) |x| sum += x;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum, 0.0001);
+
+    // Larger input should have larger probability
+    try std.testing.expect(t.data[2] > t.data[1]);
+    try std.testing.expect(t.data[1] > t.data[0]);
+}
+
+test "softmax 2D" {
+    const allocator = std.testing.allocator;
+
+    var t = try DenseTensor(f64).init(allocator, &[_]usize{ 2, 3 });
+    defer t.deinit();
+    // Row 0: [1, 2, 3]
+    t.data[0] = 1.0;
+    t.data[1] = 2.0;
+    t.data[2] = 3.0;
+    // Row 1: [0, 0, 0]
+    t.data[3] = 0.0;
+    t.data[4] = 0.0;
+    t.data[5] = 0.0;
+
+    softmaxTensor(&t);
+
+    // Each row should sum to 1.0
+    const sum0: f64 = t.data[0] + t.data[1] + t.data[2];
+    const sum1: f64 = t.data[3] + t.data[4] + t.data[5];
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum0, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), sum1, 0.0001);
+
+    // Uniform input should give uniform output
+    try std.testing.expectApproxEqAbs(t.data[3], t.data[4], 0.0001);
+    try std.testing.expectApproxEqAbs(t.data[4], t.data[5], 0.0001);
 }
