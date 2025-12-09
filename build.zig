@@ -46,4 +46,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_lexer_tests = b.addRunArtifact(lexer_tests);
     test_step.dependOn(&run_lexer_tests.step);
+
+    // Type checker tests
+    const type_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontend/types.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_type_tests = b.addRunArtifact(type_tests);
+    test_step.dependOn(&run_type_tests.step);
 }

@@ -5,6 +5,7 @@ const std = @import("std");
 const lexer = @import("frontend/lexer.zig");
 const parser = @import("frontend/parser.zig");
 const ast = @import("frontend/ast.zig");
+const types = @import("frontend/types.zig");
 const interpreter = @import("runtime/interpreter.zig");
 const tensor_mod = @import("runtime/tensor.zig");
 
@@ -54,6 +55,12 @@ pub fn main() !void {
         try runFile(allocator, file_path, use_fixpoint);
     } else if (std.mem.eql(u8, command, "repl")) {
         try runRepl(allocator);
+    } else if (std.mem.eql(u8, command, "check")) {
+        if (args.len < 3) {
+            std.debug.print("Error: 'check' command requires a file path\n", .{});
+            return;
+        }
+        try checkFile(allocator, args[2]);
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
@@ -78,6 +85,7 @@ fn printUsage() !void {
         \\  repl                 Start interactive REPL (Read-Eval-Print Loop)
         \\  lex <file>           Tokenize a .tl file and print tokens
         \\  parse <file>         Parse a .tl file and print AST summary
+        \\  check <file>         Type check a .tl file (Boolean vs Real inference)
         \\  run <file>           Execute a .tl program (single pass)
         \\  run -f <file>        Execute with fixpoint iteration (for recursive rules)
         \\  help                 Show this help message
@@ -595,6 +603,83 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
                 stdout.writeAll(msg) catch continue;
             },
         }
+    }
+}
+
+fn checkFile(allocator: std.mem.Allocator, path: []const u8) !void {
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        return;
+    };
+    defer allocator.free(source);
+
+    // Use arena for AST nodes
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ast_allocator = arena.allocator();
+
+    var lex = lexer.Lexer.init(allocator, source);
+    defer lex.deinit();
+
+    const tokens = lex.scanTokens() catch |err| {
+        std.debug.print("Lexer error: {}\n", .{err});
+        return;
+    };
+
+    var p = parser.Parser.init(ast_allocator, tokens);
+    defer p.deinit();
+
+    const program = p.parse() catch |err| {
+        if (p.getLastError()) |parse_err| {
+            std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ path, parse_err.location.line, parse_err.location.column, parse_err.message });
+        } else {
+            std.debug.print("Parse error: {}\n", .{err});
+        }
+        return;
+    };
+
+    // Run type checker
+    var checker = types.TypeChecker.init(allocator);
+    defer checker.deinit();
+
+    checker.check(&program) catch |err| {
+        std.debug.print("Type check error: {}\n", .{err});
+        return;
+    };
+
+    const stdout = std.fs.File.stdout();
+
+    // Print type information for all tensors
+    const header = std.fmt.allocPrint(allocator, "Type checking {s}...\n\n", .{path}) catch return;
+    defer allocator.free(header);
+    stdout.writeAll(header) catch return;
+
+    // Print inferred types
+    stdout.writeAll("Inferred tensor types:\n") catch return;
+    var iter = checker.env.tensor_types.iterator();
+    while (iter.next()) |entry| {
+        const type_str = entry.value_ptr.value_type.format();
+        const sparse_str: []const u8 = if (entry.value_ptr.is_sparse) " (sparse)" else "";
+        const msg = std.fmt.allocPrint(allocator, "  {s}: {s}{s}\n", .{ entry.key_ptr.*, type_str, sparse_str }) catch continue;
+        defer allocator.free(msg);
+        stdout.writeAll(msg) catch continue;
+    }
+
+    // Print any warnings
+    if (checker.env.errors.items.len > 0) {
+        stdout.writeAll("\nType warnings:\n") catch return;
+        for (checker.env.errors.items) |err| {
+            const msg = std.fmt.allocPrint(allocator, "  {s}:{d}:{d}: warning: {s}\n", .{
+                path,
+                err.location.line,
+                err.location.column,
+                err.message,
+            }) catch continue;
+            defer allocator.free(msg);
+            stdout.writeAll(msg) catch continue;
+        }
+    } else {
+        stdout.writeAll("\nNo type warnings.\n") catch return;
     }
 }
 
