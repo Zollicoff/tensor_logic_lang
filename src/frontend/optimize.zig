@@ -372,6 +372,8 @@ test "identity reduction" {
     // Should return just 42 (the identity was folded first since both are constants)
     try std.testing.expect(result.* == .literal);
     try std.testing.expectEqual(@as(i64, 42), result.literal.integer);
+
+    allocator.destroy(result);
 }
 
 test "nonlinearity folding" {

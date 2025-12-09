@@ -90,4 +90,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_ast_opt_tests = b.addRunArtifact(ast_opt_tests);
     test_step.dependOn(&run_ast_opt_tests.step);
+
+    // Probability inference tests
+    const prob_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime/probability.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_prob_tests = b.addRunArtifact(prob_tests);
+    test_step.dependOn(&run_prob_tests.step);
+
+    // Training module tests
+    const training_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime/training.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_training_tests = b.addRunArtifact(training_tests);
+    test_step.dependOn(&run_training_tests.step);
 }
