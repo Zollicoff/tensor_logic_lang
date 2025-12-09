@@ -258,7 +258,7 @@ fn einsumLoop(
 
 /// Sparse-sparse einsum for two operands
 /// C[out_indices] = A[a_indices] B[b_indices]
-/// Only iterates over non-zero entries - much faster for sparse tensors!
+/// Uses hash-based lookup for O(nnz_a + nnz_b) when there are contracted indices
 pub fn sparseEinsum2(
     allocator: std.mem.Allocator,
     a: *const SparseTensor(f64),
@@ -288,28 +288,31 @@ pub fn sparseEinsum2(
     }
 
     // Find contracted indices (in both A and B but not in output)
-    var contracted = std.ArrayListUnmanaged([]const u8){};
-    defer contracted.deinit(allocator);
+    // Also find their positions in B's index list
+    var contracted_names = std.ArrayListUnmanaged([]const u8){};
+    defer contracted_names.deinit(allocator);
+    var contracted_pos_in_a = std.ArrayListUnmanaged(usize){};
+    defer contracted_pos_in_a.deinit(allocator);
+    var contracted_pos_in_b = std.ArrayListUnmanaged(usize){};
+    defer contracted_pos_in_b.deinit(allocator);
 
-    for (a_indices) |a_idx| {
-        var in_b = false;
-        for (b_indices) |b_idx| {
+    for (a_indices, 0..) |a_idx, a_pos| {
+        for (b_indices, 0..) |b_idx, b_pos| {
             if (std.mem.eql(u8, a_idx, b_idx)) {
-                in_b = true;
-                break;
-            }
-        }
-        if (in_b) {
-            // Check if it's in output
-            var in_out = false;
-            for (out_indices) |o_idx| {
-                if (std.mem.eql(u8, a_idx, o_idx)) {
-                    in_out = true;
-                    break;
+                // Check if it's in output
+                var in_out = false;
+                for (out_indices) |o_idx| {
+                    if (std.mem.eql(u8, a_idx, o_idx)) {
+                        in_out = true;
+                        break;
+                    }
                 }
-            }
-            if (!in_out) {
-                try contracted.append(allocator, a_idx);
+                if (!in_out) {
+                    try contracted_names.append(allocator, a_idx);
+                    try contracted_pos_in_a.append(allocator, a_pos);
+                    try contracted_pos_in_b.append(allocator, b_pos);
+                }
+                break;
             }
         }
     }
@@ -317,56 +320,99 @@ pub fn sparseEinsum2(
     // Create output sparse tensor
     var c = try SparseTensor(f64).init(allocator, out_shape);
 
-    // Sparse einsum: iterate only over non-zero entries in A
-    // For each non-zero A[...], find matching non-zeros in B
-    var iter_a = a.iterator();
-    while (iter_a.next()) |entry_a| {
-        // Extract A's index values for each index name
-        var a_idx_map = std.StringHashMap(usize).init(allocator);
-        defer a_idx_map.deinit();
-        for (a_indices, 0..) |idx_name, dim| {
-            try a_idx_map.put(idx_name, entry_a.indices[dim]);
+    // If there are contracted indices, build a hash map for B entries
+    // Key: contracted index values, Value: list of (entry_index, full_indices, value)
+    if (contracted_names.items.len > 0) {
+        // Build hash map: contracted values -> list of B entry indices
+        var b_hash = std.AutoHashMap(u64, std.ArrayListUnmanaged(usize)).init(allocator);
+        defer {
+            var iter = b_hash.valueIterator();
+            while (iter.next()) |list| {
+                list.deinit(allocator);
+            }
+            b_hash.deinit();
         }
 
-        // Find matching entries in B
-        var iter_b = b.iterator();
-        while (iter_b.next()) |entry_b| {
-            // Extract B's index values
-            var b_idx_map = std.StringHashMap(usize).init(allocator);
-            defer b_idx_map.deinit();
-            for (b_indices, 0..) |idx_name, dim| {
-                try b_idx_map.put(idx_name, entry_b.indices[dim]);
+        // Populate hash map with B entries
+        for (b.indices.items, 0..) |b_idx, entry_idx| {
+            const key = computeContractedKey(b_idx, contracted_pos_in_b.items);
+            const result = try b_hash.getOrPut(key);
+            if (!result.found_existing) {
+                result.value_ptr.* = std.ArrayListUnmanaged(usize){};
             }
+            try result.value_ptr.append(allocator, entry_idx);
+        }
 
-            // Check if contracted indices match
-            var matches = true;
-            for (contracted.items) |contr_idx| {
-                const a_val = a_idx_map.get(contr_idx);
-                const b_val = b_idx_map.get(contr_idx);
-                if (a_val != null and b_val != null and a_val.? != b_val.?) {
-                    matches = false;
-                    break;
+        // For each A entry, look up matching B entries via hash
+        for (a.indices.items, a.values.items) |a_idx, a_val| {
+            const key = computeContractedKey(a_idx, contracted_pos_in_a.items);
+
+            if (b_hash.get(key)) |matching_b_entries| {
+                for (matching_b_entries.items) |b_entry_idx| {
+                    const b_idx = b.indices.items[b_entry_idx];
+                    const b_val = b.values.items[b_entry_idx];
+
+                    // Compute output index
+                    var c_idx = try allocator.alloc(usize, out_indices.len);
+                    defer allocator.free(c_idx);
+
+                    for (out_indices, 0..) |idx_name, i| {
+                        // Find in A indices first
+                        var found = false;
+                        for (a_indices, 0..) |a_name, a_dim| {
+                            if (std.mem.eql(u8, idx_name, a_name)) {
+                                c_idx[i] = a_idx[a_dim];
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            // Find in B indices
+                            for (b_indices, 0..) |b_name, b_dim| {
+                                if (std.mem.eql(u8, idx_name, b_name)) {
+                                    c_idx[i] = b_idx[b_dim];
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Accumulate product
+                    const prod = a_val * b_val;
+                    const old_val = c.get(c_idx);
+                    try c.set(c_idx, old_val + prod);
                 }
             }
-
-            if (matches) {
+        }
+    } else {
+        // No contracted indices - compute outer product (all pairs)
+        for (a.indices.items, a.values.items) |a_idx, a_val| {
+            for (b.indices.items, b.values.items) |b_idx, b_val| {
                 // Compute output index
                 var c_idx = try allocator.alloc(usize, out_indices.len);
                 defer allocator.free(c_idx);
 
                 for (out_indices, 0..) |idx_name, i| {
-                    // Check A first, then B
-                    if (a_idx_map.get(idx_name)) |val| {
-                        c_idx[i] = val;
-                    } else if (b_idx_map.get(idx_name)) |val| {
-                        c_idx[i] = val;
-                    } else {
-                        c_idx[i] = 0;
+                    var found = false;
+                    for (a_indices, 0..) |a_name, a_dim| {
+                        if (std.mem.eql(u8, idx_name, a_name)) {
+                            c_idx[i] = a_idx[a_dim];
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        for (b_indices, 0..) |b_name, b_dim| {
+                            if (std.mem.eql(u8, idx_name, b_name)) {
+                                c_idx[i] = b_idx[b_dim];
+                                break;
+                            }
+                        }
                     }
                 }
 
                 // Accumulate product
-                const prod = entry_a.value * entry_b.value;
+                const prod = a_val * b_val;
                 const old_val = c.get(c_idx);
                 try c.set(c_idx, old_val + prod);
             }
@@ -374,6 +420,16 @@ pub fn sparseEinsum2(
     }
 
     return c;
+}
+
+/// Compute a hash key from contracted index values
+fn computeContractedKey(indices: []const usize, positions: []const usize) u64 {
+    var key: u64 = 0;
+    for (positions) |pos| {
+        // Simple hash combining
+        key = key *% 31 +% indices[pos];
+    }
+    return key;
 }
 
 /// Sparse-dense einsum: sparse A, dense B -> sparse result

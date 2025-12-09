@@ -419,6 +419,45 @@ pub const Interpreter = struct {
                             else => {},
                         }
                     },
+                    .f64_sparse => |*lhs_sparse| {
+                        switch (rhs_val) {
+                            .tensor_val => |rv| {
+                                if (rv == .f64_sparse) {
+                                    // Merge sparse tensors: max of values at same index
+                                    for (rv.f64_sparse.indices.items, rv.f64_sparse.values.items) |idx, val| {
+                                        const old_val = lhs_sparse.get(idx);
+                                        lhs_sparse.set(idx, @max(old_val, val)) catch {};
+                                    }
+                                } else if (rv == .f64_dense) {
+                                    // RHS is dense - iterate over all non-zeros in RHS
+                                    for (rv.f64_dense.data, 0..) |val, flat_idx| {
+                                        if (val > 0) {
+                                            // Convert flat index to multi-index
+                                            const rank = rv.f64_dense.shape.dims.len;
+                                            var multi_idx = self.allocator.alloc(usize, rank) catch continue;
+                                            defer self.allocator.free(multi_idx);
+                                            var remaining = flat_idx;
+                                            var stride: usize = 1;
+                                            var i = rank;
+                                            while (i > 0) {
+                                                i -= 1;
+                                                stride = 1;
+                                                var j = i + 1;
+                                                while (j < rank) : (j += 1) {
+                                                    stride *= rv.f64_dense.shape.dims[j];
+                                                }
+                                                multi_idx[i] = remaining / stride;
+                                                remaining = remaining % stride;
+                                            }
+                                            const old_val = lhs_sparse.get(multi_idx);
+                                            lhs_sparse.set(multi_idx, @max(old_val, val)) catch {};
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
+                    },
                     else => {},
                 }
             },
@@ -524,6 +563,26 @@ pub const Interpreter = struct {
                     },
                 }
             },
+            .f64_sparse => |*sparse| {
+                switch (eq.op) {
+                    .assign => sparse.set(indices, scalar) catch return InterpreterError.OutOfMemory,
+                    .add => {
+                        const old = sparse.get(indices);
+                        sparse.set(indices, old + scalar) catch return InterpreterError.OutOfMemory;
+                    },
+                    .max => {
+                        const old = sparse.get(indices);
+                        sparse.set(indices, @max(old, scalar)) catch return InterpreterError.OutOfMemory;
+                    },
+                    .min => {
+                        const old = sparse.get(indices);
+                        sparse.set(indices, @min(old, scalar)) catch return InterpreterError.OutOfMemory;
+                    },
+                    .avg => {
+                        // For avg, we'd need a count - skip for now
+                    },
+                }
+            },
             else => return InterpreterError.NotImplemented,
         }
     }
@@ -540,6 +599,10 @@ pub const Interpreter = struct {
                             const new_dense = DenseTensor(f64).init(self.allocator, dense.shape.dims) catch return InterpreterError.OutOfMemory;
                             @memcpy(new_dense.data, dense.data);
                             return Value{ .tensor_val = Tensor{ .f64_dense = new_dense } };
+                        },
+                        .f64_sparse => |sparse| {
+                            const new_sparse = sparse.clone() catch return InterpreterError.OutOfMemory;
+                            return Value{ .tensor_val = Tensor{ .f64_sparse = new_sparse } };
                         },
                         else => {
                             // For other types, create zeros with same shape
