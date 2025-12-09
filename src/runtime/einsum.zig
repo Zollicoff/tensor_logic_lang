@@ -653,16 +653,54 @@ fn softmax1D(data: []f64) void {
 }
 
 /// Apply softmax to tensor (convenience wrapper)
+/// Default: normalizes over last axis for 2D tensors
 pub fn softmaxTensor(t: *DenseTensor(f64)) void {
+    softmaxTensorAxis(t, null);
+}
+
+/// Apply softmax along a specific axis
+/// axis=null means default behavior (last axis for 2D, full tensor for 1D)
+/// axis=0 means normalize over rows (each column sums to 1)
+/// axis=1 means normalize over columns (each row sums to 1)
+pub fn softmaxTensorAxis(t: *DenseTensor(f64), axis: ?usize) void {
     if (t.shape.rank() == 1) {
         softmax1D(t.data);
     } else if (t.shape.rank() == 2) {
         const rows = t.shape.dims[0];
         const cols = t.shape.dims[1];
-        for (0..rows) |i| {
-            const start = i * cols;
-            const end = start + cols;
-            softmax1D(t.data[start..end]);
+        const norm_axis = axis orelse 1; // Default: normalize over columns (last axis)
+
+        if (norm_axis == 1) {
+            // Normalize over columns (each row sums to 1)
+            for (0..rows) |i| {
+                const start = i * cols;
+                const end = start + cols;
+                softmax1D(t.data[start..end]);
+            }
+        } else if (norm_axis == 0) {
+            // Normalize over rows (each column sums to 1)
+            for (0..cols) |j| {
+                // Find max for numerical stability
+                var max_val: f64 = t.data[j];
+                for (0..rows) |i| {
+                    const idx = i * cols + j;
+                    if (t.data[idx] > max_val) max_val = t.data[idx];
+                }
+
+                // Compute exp(x - max) and sum
+                var sum: f64 = 0.0;
+                for (0..rows) |i| {
+                    const idx = i * cols + j;
+                    t.data[idx] = @exp(t.data[idx] - max_val);
+                    sum += t.data[idx];
+                }
+
+                // Normalize
+                for (0..rows) |i| {
+                    const idx = i * cols + j;
+                    t.data[idx] /= sum;
+                }
+            }
         }
     }
 }

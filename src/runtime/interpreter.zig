@@ -44,6 +44,32 @@ fn getIndexName(idx: Index) ?[]const u8 {
     };
 }
 
+/// Find the normalization axis position from a tensor reference
+/// Returns the axis index where the normalize marker appears, or null if none
+fn findNormalizationAxis(ref: *const ast.TensorRef) ?usize {
+    for (ref.indices, 0..) |idx, pos| {
+        if (idx == .normalize) {
+            return pos;
+        }
+    }
+    return null;
+}
+
+/// Find normalization axis from an expression (looks inside tensor refs)
+fn findNormAxisInExpr(expr: *const ast.Expr) ?usize {
+    switch (expr.*) {
+        .tensor_ref => |ref| return findNormalizationAxis(&ref),
+        .group => |inner| return findNormAxisInExpr(inner),
+        .product => |prod| {
+            for (prod.factors) |factor| {
+                if (findNormAxisInExpr(factor)) |axis| return axis;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
 /// Runtime value - either a tensor or a scalar
 pub const Value = union(enum) {
     tensor_val: Tensor,
@@ -180,13 +206,131 @@ pub const Interpreter = struct {
         return self.tensors.getPtr(name);
     }
 
-    /// Execute a full program
+    /// Execute a full program (forward chaining - evaluates all equations)
     pub fn execute(self: *Interpreter, program: *const ast.Program) !void {
         for (program.statements) |stmt| {
             try self.executeStatement(&stmt);
         }
         // Store for REPL fixpoint iteration
         self.last_program = program;
+    }
+
+    /// Backward chaining inference: evaluate only what's needed for a specific tensor
+    /// This is goal-directed - starts with the target and works backward
+    pub fn evaluateBackward(self: *Interpreter, program: *const ast.Program, target_name: []const u8, memo: *std.StringHashMap(Tensor)) !?Tensor {
+        // Check memo first (already computed)
+        if (memo.get(target_name)) |t| {
+            return t;
+        }
+
+        // Check if tensor already has data
+        if (self.tensors.get(target_name)) |t| {
+            // Only return if it has non-zero data (base facts)
+            switch (t) {
+                .f64_dense => |dense| {
+                    var has_data = false;
+                    for (dense.data) |v| {
+                        if (v != 0.0) {
+                            has_data = true;
+                            break;
+                        }
+                    }
+                    if (has_data) {
+                        try memo.put(target_name, t);
+                        return t;
+                    }
+                },
+                .f64_sparse => |sparse| {
+                    if (sparse.indices.items.len > 0) {
+                        try memo.put(target_name, t);
+                        return t;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Find equations that define this tensor
+        var found_equation = false;
+        for (program.statements) |stmt| {
+            switch (stmt) {
+                .equation => |eq| {
+                    if (std.mem.eql(u8, eq.lhs.name, target_name)) {
+                        found_equation = true;
+                        // First, recursively evaluate dependencies
+                        try self.evaluateExprDependencies(eq.rhs, program, memo);
+                        // Then evaluate this equation
+                        try self.executeEquation(&eq);
+                    }
+                },
+                .domain_decl => |d| {
+                    // Process domain declarations needed
+                    if (d.size) |size| {
+                        if (!self.domains.contains(d.name)) {
+                            try self.defineDomain(d.name, @intCast(size));
+                        }
+                    }
+                },
+                .sparse_decl => |s| {
+                    // Process sparse declarations needed
+                    if (std.mem.eql(u8, s.name, target_name) and !self.tensors.contains(s.name)) {
+                        try self.executeStatement(&stmt);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (!found_equation) {
+            return null; // No equation defines this tensor
+        }
+
+        // Get the computed tensor
+        if (self.tensors.get(target_name)) |t| {
+            try memo.put(target_name, t);
+            return t;
+        }
+
+        return null;
+    }
+
+    /// Helper: recursively find and evaluate dependencies in an expression
+    fn evaluateExprDependencies(self: *Interpreter, expr: *const ast.Expr, program: *const ast.Program, memo: *std.StringHashMap(Tensor)) !void {
+        switch (expr.*) {
+            .tensor_ref => |ref| {
+                _ = try self.evaluateBackward(program, ref.name, memo);
+            },
+            .product => |prod| {
+                for (prod.factors) |factor| {
+                    try self.evaluateExprDependencies(factor, program, memo);
+                }
+            },
+            .binary => |bin| {
+                try self.evaluateExprDependencies(bin.left, program, memo);
+                try self.evaluateExprDependencies(bin.right, program, memo);
+            },
+            .unary => |un| {
+                try self.evaluateExprDependencies(un.operand, program, memo);
+            },
+            .nonlinearity => |nl| {
+                try self.evaluateExprDependencies(nl.arg, program, memo);
+            },
+            .group => |inner| {
+                try self.evaluateExprDependencies(inner, program, memo);
+            },
+            .conditional => |cond| {
+                try self.evaluateExprDependencies(cond.condition, program, memo);
+                try self.evaluateExprDependencies(cond.then_branch, program, memo);
+                if (cond.else_branch) |eb| {
+                    try self.evaluateExprDependencies(eb, program, memo);
+                }
+            },
+            .embed => |emb| {
+                try self.evaluateExprDependencies(emb.embedding, program, memo);
+                try self.evaluateExprDependencies(emb.index, program, memo);
+            },
+            .literal => {},
+        }
     }
 
     /// Execute a single statement
@@ -888,6 +1032,31 @@ pub const Interpreter = struct {
     fn evaluateExprWithIndices(self: *Interpreter, expr: *const ast.Expr, output_indices: []const []const u8) InterpreterError!Value {
         switch (expr.*) {
             .tensor_ref => |ref| {
+                // Check for special index types
+                var has_virtual = false;
+                var has_arithmetic = false;
+                var has_slice = false;
+                for (ref.indices) |idx| {
+                    if (idx == .virtual) has_virtual = true;
+                    if (idx == .arithmetic) has_arithmetic = true;
+                    if (idx == .slice) has_slice = true;
+                }
+
+                if (has_virtual) {
+                    // Perform gather operation
+                    return try self.evaluateVirtualIndexGather(ref);
+                }
+
+                if (has_arithmetic) {
+                    // Perform shifted access
+                    return try self.evaluateArithmeticIndexShift(ref);
+                }
+
+                if (has_slice) {
+                    // Perform slice extraction
+                    return try self.evaluateSlice(ref);
+                }
+
                 if (self.tensors.get(ref.name)) |t| {
                     // Return a copy of the tensor with actual data
                     switch (t) {
@@ -960,6 +1129,9 @@ pub const Interpreter = struct {
                 // since nonlinearity is applied element-wise
                 var arg_val = try self.evaluateExprWithIndices(nl.arg, output_indices);
 
+                // Check for normalization axis (for softmax)
+                const norm_axis = findNormAxisInExpr(nl.arg);
+
                 // Apply nonlinearity in-place
                 switch (arg_val) {
                     .tensor_val => |*t| {
@@ -969,7 +1141,7 @@ pub const Interpreter = struct {
                                     .step => einsum.stepTensor(dense),
                                     .relu => einsum.reluTensor(dense),
                                     .sigmoid => einsum.sigmoidTensor(dense),
-                                    .softmax => einsum.softmaxTensor(dense),
+                                    .softmax => einsum.softmaxTensorAxis(dense, norm_axis),
                                     .tanh => einsum.tanhTensor(dense),
                                     .exp => einsum.expTensor(dense),
                                     .log => einsum.logTensor(dense),
@@ -1199,6 +1371,290 @@ pub const Interpreter = struct {
                 }
             },
         }
+    }
+
+    /// Evaluate a tensor reference with slice indices
+    /// E.g., X[2:5] extracts elements from index 2 to 4 (exclusive end)
+    fn evaluateSlice(self: *Interpreter, ref: ast.TensorRef) InterpreterError!Value {
+        // Get the source tensor
+        const src_tensor = self.tensors.get(ref.name) orelse return InterpreterError.UndefinedTensor;
+
+        // Only support f64_dense for now
+        if (src_tensor != .f64_dense) {
+            return InterpreterError.NotImplemented;
+        }
+        const src = src_tensor.f64_dense;
+
+        // Handle 1D slice: X[start:end]
+        if (ref.indices.len == 1 and src.shape.rank() == 1) {
+            const idx = ref.indices[0];
+            if (idx == .slice) {
+                const slice_info = idx.slice;
+                const start: usize = @intCast(@max(0, slice_info.start));
+                const end: usize = @intCast(@min(@as(i64, @intCast(src.shape.dims[0])), slice_info.end));
+
+                if (start >= end) {
+                    // Empty slice
+                    const result = DenseTensor(f64).init(self.allocator, &[_]usize{0}) catch return InterpreterError.OutOfMemory;
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                }
+
+                const slice_len = end - start;
+                var result = DenseTensor(f64).init(self.allocator, &[_]usize{slice_len}) catch return InterpreterError.OutOfMemory;
+
+                for (0..slice_len) |i| {
+                    result.data[i] = src.data[start + i];
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+        }
+
+        // Handle 2D slice on first dimension: X[start:end, j]
+        if (ref.indices.len == 2 and src.shape.rank() == 2) {
+            const idx0 = ref.indices[0];
+            const idx1 = ref.indices[1];
+
+            if (idx0 == .slice and idx1 != .slice) {
+                const slice_info = idx0.slice;
+                const start: usize = @intCast(@max(0, slice_info.start));
+                const end: usize = @intCast(@min(@as(i64, @intCast(src.shape.dims[0])), slice_info.end));
+
+                if (start >= end) {
+                    const result = DenseTensor(f64).init(self.allocator, &[_]usize{ 0, src.shape.dims[1] }) catch return InterpreterError.OutOfMemory;
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                }
+
+                const slice_rows = end - start;
+                const cols = src.shape.dims[1];
+                var result = DenseTensor(f64).init(self.allocator, &[_]usize{ slice_rows, cols }) catch return InterpreterError.OutOfMemory;
+
+                for (0..slice_rows) |i| {
+                    for (0..cols) |j| {
+                        result.data[i * cols + j] = src.data[(start + i) * cols + j];
+                    }
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+
+            // Handle 2D slice on second dimension: X[i, start:end]
+            if (idx0 != .slice and idx1 == .slice) {
+                const slice_info = idx1.slice;
+                const start: usize = @intCast(@max(0, slice_info.start));
+                const end: usize = @intCast(@min(@as(i64, @intCast(src.shape.dims[1])), slice_info.end));
+
+                if (start >= end) {
+                    const result = DenseTensor(f64).init(self.allocator, &[_]usize{ src.shape.dims[0], 0 }) catch return InterpreterError.OutOfMemory;
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                }
+
+                const rows = src.shape.dims[0];
+                const slice_cols = end - start;
+                var result = DenseTensor(f64).init(self.allocator, &[_]usize{ rows, slice_cols }) catch return InterpreterError.OutOfMemory;
+
+                for (0..rows) |i| {
+                    for (0..slice_cols) |j| {
+                        result.data[i * slice_cols + j] = src.data[i * src.shape.dims[1] + (start + j)];
+                    }
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+        }
+
+        // Fallback: just return a copy
+        const new_dense = DenseTensor(f64).init(self.allocator, src.shape.dims) catch return InterpreterError.OutOfMemory;
+        @memcpy(new_dense.data, src.data);
+        return Value{ .tensor_val = Tensor{ .f64_dense = new_dense } };
+    }
+
+    /// Evaluate a tensor reference with arithmetic indices (shifted access)
+    /// E.g., X[i-1] creates a tensor where result[i] = X[i-1]
+    fn evaluateArithmeticIndexShift(self: *Interpreter, ref: ast.TensorRef) InterpreterError!Value {
+        // Get the source tensor
+        const src_tensor = self.tensors.get(ref.name) orelse return InterpreterError.UndefinedTensor;
+
+        // Only support f64_dense for now
+        if (src_tensor != .f64_dense) {
+            return InterpreterError.NotImplemented;
+        }
+        const src = src_tensor.f64_dense;
+
+        // Find arithmetic indices and their offsets
+        // For simplicity, handle the common case: 1D tensor with single arithmetic index
+        if (ref.indices.len == 1 and src.shape.rank() == 1) {
+            const idx = ref.indices[0];
+            if (idx == .arithmetic) {
+                const arith = idx.arithmetic;
+                const offset: i64 = if (arith.op == .add) arith.offset else -arith.offset;
+
+                // Create result tensor with same shape
+                const n = src.shape.dims[0];
+                var result = DenseTensor(f64).init(self.allocator, src.shape.dims) catch return InterpreterError.OutOfMemory;
+                result.fill(0.0);
+
+                // Shift the data: result[i] = src[i + offset]
+                for (0..n) |i| {
+                    const src_idx: i64 = @as(i64, @intCast(i)) + offset;
+                    if (src_idx >= 0 and src_idx < @as(i64, @intCast(n))) {
+                        result.data[i] = src.data[@intCast(src_idx)];
+                    }
+                    // Out of bounds indices get 0 (default value)
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+        }
+
+        // Handle 2D case: X[i-1, j] shifts along first dimension
+        if (ref.indices.len == 2 and src.shape.rank() == 2) {
+            const idx0 = ref.indices[0];
+            const idx1 = ref.indices[1];
+
+            // Only first index is arithmetic
+            if (idx0 == .arithmetic and idx1 != .arithmetic) {
+                const arith = idx0.arithmetic;
+                const offset: i64 = if (arith.op == .add) arith.offset else -arith.offset;
+
+                const rows = src.shape.dims[0];
+                const cols = src.shape.dims[1];
+                var result = DenseTensor(f64).init(self.allocator, src.shape.dims) catch return InterpreterError.OutOfMemory;
+                result.fill(0.0);
+
+                // result[i, j] = src[i + offset, j]
+                for (0..rows) |i| {
+                    const src_row: i64 = @as(i64, @intCast(i)) + offset;
+                    if (src_row >= 0 and src_row < @as(i64, @intCast(rows))) {
+                        const src_row_u: usize = @intCast(src_row);
+                        for (0..cols) |j| {
+                            result.data[i * cols + j] = src.data[src_row_u * cols + j];
+                        }
+                    }
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+
+            // Only second index is arithmetic
+            if (idx0 != .arithmetic and idx1 == .arithmetic) {
+                const arith = idx1.arithmetic;
+                const offset: i64 = if (arith.op == .add) arith.offset else -arith.offset;
+
+                const rows = src.shape.dims[0];
+                const cols = src.shape.dims[1];
+                var result = DenseTensor(f64).init(self.allocator, src.shape.dims) catch return InterpreterError.OutOfMemory;
+                result.fill(0.0);
+
+                // result[i, j] = src[i, j + offset]
+                for (0..rows) |i| {
+                    for (0..cols) |j| {
+                        const src_col: i64 = @as(i64, @intCast(j)) + offset;
+                        if (src_col >= 0 and src_col < @as(i64, @intCast(cols))) {
+                            result.data[i * cols + j] = src.data[i * cols + @as(usize, @intCast(src_col))];
+                        }
+                    }
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+        }
+
+        // Fallback: just return a copy (no shift applied)
+        const new_dense = DenseTensor(f64).init(self.allocator, src.shape.dims) catch return InterpreterError.OutOfMemory;
+        @memcpy(new_dense.data, src.data);
+        return Value{ .tensor_val = Tensor{ .f64_dense = new_dense } };
+    }
+
+    /// Evaluate a tensor reference with virtual indices (gather/embedding lookup)
+    /// E.g., E[*idx, d] looks up rows of E using values from idx as row indices
+    fn evaluateVirtualIndexGather(self: *Interpreter, ref: ast.TensorRef) InterpreterError!Value {
+        // Get the source tensor
+        const src_tensor = self.tensors.get(ref.name) orelse return InterpreterError.UndefinedTensor;
+
+        // Only support f64_dense for now
+        if (src_tensor != .f64_dense) {
+            return InterpreterError.NotImplemented;
+        }
+        const src = src_tensor.f64_dense;
+
+        // Find the virtual index and the index tensor
+        var virtual_pos: ?usize = null;
+        var index_tensor_name: ?[]const u8 = null;
+
+        for (ref.indices, 0..) |idx, pos| {
+            if (idx == .virtual) {
+                virtual_pos = pos;
+                index_tensor_name = idx.virtual;
+                break;
+            }
+        }
+
+        const idx_name = index_tensor_name orelse return InterpreterError.NotImplemented;
+        const v_pos = virtual_pos orelse return InterpreterError.NotImplemented;
+
+        // Get the index tensor (contains the indices to gather)
+        const idx_tensor_val = self.tensors.get(idx_name) orelse return InterpreterError.UndefinedTensor;
+        if (idx_tensor_val != .f64_dense) {
+            return InterpreterError.NotImplemented;
+        }
+        const idx_tensor = idx_tensor_val.f64_dense;
+
+        // Determine output shape:
+        // - Virtual index dimension is replaced by the index tensor's shape
+        // - Other dimensions stay the same
+        var out_shape = std.ArrayListUnmanaged(usize){};
+        defer out_shape.deinit(self.allocator);
+
+        for (ref.indices, 0..) |_, pos| {
+            if (pos == v_pos) {
+                // Replace with index tensor dimensions
+                for (idx_tensor.shape.dims) |d| {
+                    out_shape.append(self.allocator, d) catch return InterpreterError.OutOfMemory;
+                }
+            } else {
+                // Keep original dimension
+                if (pos < src.shape.dims.len) {
+                    out_shape.append(self.allocator, src.shape.dims[pos]) catch return InterpreterError.OutOfMemory;
+                }
+            }
+        }
+
+        // Create output tensor
+        var result = DenseTensor(f64).init(self.allocator, out_shape.items) catch return InterpreterError.OutOfMemory;
+
+        // Perform gather operation
+        // For E[*idx, d] where idx has shape [n]:
+        // result[i, d] = src[idx[i], d] for each i in 0..n, d in 0..D
+        if (idx_tensor.shape.dims.len == 1 and src.shape.dims.len == 2 and v_pos == 0) {
+            // Common case: 2D embedding lookup E[*idx, d] -> result[n, d]
+            const n = idx_tensor.shape.dims[0];
+            const d_size = src.shape.dims[1];
+
+            for (0..n) |i| {
+                const idx_val: usize = @intFromFloat(idx_tensor.data[i]);
+                // Bounds check
+                if (idx_val < src.shape.dims[0]) {
+                    for (0..d_size) |d| {
+                        result.data[i * d_size + d] = src.data[idx_val * d_size + d];
+                    }
+                }
+            }
+        } else if (idx_tensor.shape.dims.len == 1 and src.shape.dims.len == 1 and v_pos == 0) {
+            // 1D gather: src[*idx] -> result[n]
+            const n = idx_tensor.shape.dims[0];
+            for (0..n) |i| {
+                const idx_val: usize = @intFromFloat(idx_tensor.data[i]);
+                if (idx_val < src.shape.dims[0]) {
+                    result.data[i] = src.data[idx_val];
+                }
+            }
+        } else {
+            // General case - not yet implemented
+            result.fill(0.0);
+        }
+
+        return Value{ .tensor_val = Tensor{ .f64_dense = result } };
     }
 
     /// Evaluate a product of tensors using einsum contraction

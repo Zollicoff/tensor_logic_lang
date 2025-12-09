@@ -322,8 +322,8 @@ pub const Parser = struct {
     }
 
     fn parseIndex(self: *Parser) ParseError!ast.Index {
-        // Check for virtual index: ~i
-        if (self.check(.at)) {
+        // Check for virtual index: *t (use tensor t's values as indices)
+        if (self.check(.star)) {
             _ = self.advance();
             const name = self.advance();
             if (name.type != .identifier) {
@@ -367,6 +367,11 @@ pub const Parser = struct {
             // Check for primed: p'
             if (self.match(.prime)) {
                 return ast.Index{ .primed = name_tok.lexeme };
+            }
+
+            // Check for normalization axis: i. (softmax normalizes over this index)
+            if (self.match(.dot)) {
+                return ast.Index{ .normalize = name_tok.lexeme };
             }
 
             // Check for arithmetic: i+1, i-1
