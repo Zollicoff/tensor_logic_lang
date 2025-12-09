@@ -243,9 +243,104 @@ pub const Interpreter = struct {
                     // We could track exports for validation, but for now just pass
                 }
             },
+            .query => |q| {
+                try self.executeQuery(&q);
+            },
             .comment => {
                 // Comments are no-ops
             },
+        }
+    }
+
+    /// Execute a query statement - prints tensor value
+    fn executeQuery(self: *Interpreter, query: *const ast.Query) !void {
+        const name = query.tensor.name;
+
+        if (self.tensors.get(name)) |t| {
+            switch (t) {
+                .f64_dense => |dense| {
+                    self.printDenseTensor(name, f64, dense);
+                },
+                .f32_dense => |dense| {
+                    self.printDenseTensor(name, f32, dense);
+                },
+                .i64_dense => |dense| {
+                    self.printDenseTensor(name, i64, dense);
+                },
+                .i32_dense => |dense| {
+                    self.printDenseTensor(name, i32, dense);
+                },
+                .bool_dense => |dense| {
+                    self.printDenseTensor(name, bool, dense);
+                },
+                .bool_sparse => |sparse| {
+                    std.debug.print("{s} = sparse relation with {d} tuples\n", .{ name, sparse.indices.items.len });
+                    const max_tuples = 10;
+                    const num_to_print = @min(sparse.indices.items.len, max_tuples);
+                    for (0..num_to_print) |i| {
+                        std.debug.print("  (", .{});
+                        for (sparse.indices.items[i], 0..) |idx, j| {
+                            if (j > 0) std.debug.print(", ", .{});
+                            std.debug.print("{d}", .{idx});
+                        }
+                        std.debug.print(")\n", .{});
+                    }
+                    if (sparse.indices.items.len > max_tuples) {
+                        std.debug.print("  ... and {d} more\n", .{sparse.indices.items.len - max_tuples});
+                    }
+                },
+                .f32_sparse, .f64_sparse => {
+                    std.debug.print("{s} = sparse tensor\n", .{name});
+                },
+            }
+        } else {
+            std.debug.print("{s} = undefined\n", .{name});
+        }
+    }
+
+    fn printDenseTensor(self: *Interpreter, name: []const u8, comptime T: type, dense: anytype) void {
+        _ = self;
+        // Print name and shape
+        std.debug.print("{s} = [", .{name});
+        for (dense.shape.dims, 0..) |dim, i| {
+            if (i > 0) std.debug.print(", ", .{});
+            std.debug.print("{d}", .{dim});
+        }
+        std.debug.print("] ", .{});
+
+        // Print values (up to a limit)
+        const max_print = 20;
+        if (dense.data.len <= max_print) {
+            std.debug.print("{{ ", .{});
+            for (dense.data, 0..) |v, i| {
+                if (i > 0) std.debug.print(", ", .{});
+                if (T == f64 or T == f32) {
+                    std.debug.print("{d:.4}", .{v});
+                } else {
+                    std.debug.print("{}", .{v});
+                }
+            }
+            std.debug.print(" }}\n", .{});
+        } else {
+            std.debug.print("{{ ", .{});
+            for (0..5) |i| {
+                if (i > 0) std.debug.print(", ", .{});
+                if (T == f64 or T == f32) {
+                    std.debug.print("{d:.4}", .{dense.data[i]});
+                } else {
+                    std.debug.print("{}", .{dense.data[i]});
+                }
+            }
+            std.debug.print(", ... , ", .{});
+            for (dense.data.len - 3..dense.data.len) |i| {
+                if (i > dense.data.len - 3) std.debug.print(", ", .{});
+                if (T == f64 or T == f32) {
+                    std.debug.print("{d:.4}", .{dense.data[i]});
+                } else {
+                    std.debug.print("{}", .{dense.data[i]});
+                }
+            }
+            std.debug.print(" }} ({d} elements)\n", .{dense.data.len});
         }
     }
 

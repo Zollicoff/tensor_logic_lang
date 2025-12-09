@@ -254,6 +254,13 @@ pub const Export = struct {
     location: SourceLocation,
 };
 
+/// Query statement: Tensor? or Tensor[i,j]?
+/// Queries the value of a tensor and prints it
+pub const Query = struct {
+    tensor: TensorRef,
+    location: SourceLocation,
+};
+
 /// Top-level statement
 pub const Statement = union(enum) {
     equation: Equation,
@@ -261,6 +268,7 @@ pub const Statement = union(enum) {
     sparse_decl: SparseDecl,
     import_stmt: Import,
     export_stmt: Export,
+    query: Query,
     comment: []const u8,
 };
 

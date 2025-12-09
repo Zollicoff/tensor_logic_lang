@@ -144,6 +144,23 @@ pub const Parser = struct {
         // Parse LHS (must be a tensor reference)
         const lhs = try self.parseTensorRef();
 
+        // Check for query: Tensor? or Tensor[i,j]?
+        if (self.match(.question)) {
+            // Consume trailing newline/comments
+            while (self.check(.comment)) {
+                _ = self.advance();
+            }
+            if (self.check(.newline)) {
+                _ = self.advance();
+            }
+            return ast.Statement{
+                .query = ast.Query{
+                    .tensor = lhs,
+                    .location = location,
+                },
+            };
+        }
+
         // Parse operator
         const op = try self.parseAccumulationOp();
 

@@ -263,6 +263,9 @@ fn runRepl(allocator: std.mem.Allocator) !void {
                 .export_stmt => |ex| {
                     printFmt(allocator, stdout, "  exported {s}\n", .{ex.name});
                 },
+                .query => |q| {
+                    printFmt(allocator, stdout, "  query {s}?\n", .{q.tensor.name});
+                },
                 .comment => {},
             }
         }
@@ -608,6 +611,11 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
             },
             .export_stmt => |ex| {
                 const msg = std.fmt.allocPrint(allocator, "Export: {s}\n", .{ex.name}) catch continue;
+                defer allocator.free(msg);
+                stdout.writeAll(msg) catch continue;
+            },
+            .query => |q| {
+                const msg = std.fmt.allocPrint(allocator, "Query: {s}?\n", .{q.tensor.name}) catch continue;
                 defer allocator.free(msg);
                 stdout.writeAll(msg) catch continue;
             },
