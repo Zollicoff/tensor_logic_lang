@@ -6,6 +6,7 @@ const lexer = @import("frontend/lexer.zig");
 const parser = @import("frontend/parser.zig");
 const ast = @import("frontend/ast.zig");
 const interpreter = @import("runtime/interpreter.zig");
+const tensor_mod = @import("runtime/tensor.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -281,10 +282,20 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool) !
         }
         writer.print("]", .{}) catch continue;
 
-        const line = std.fmt.allocPrint(allocator, "  {s}: {s} {s}\n", .{
+        // Calculate sparsity stats
+        const nnz = tensor_mod.countNonZero(&t);
+        const total = shape.numel();
+        const sparsity_pct = if (total > 0)
+            100.0 * (1.0 - @as(f64, @floatFromInt(nnz)) / @as(f64, @floatFromInt(total)))
+        else
+            0.0;
+
+        const line = std.fmt.allocPrint(allocator, "  {s}: {s} {s} ({d} nnz, {d:.1}% sparse)\n", .{
             name,
             t.dtype().name(),
             shape_str.items,
+            nnz,
+            sparsity_pct,
         }) catch continue;
         defer allocator.free(line);
         stdout.writeAll(line) catch continue;

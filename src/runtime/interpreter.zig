@@ -60,6 +60,17 @@ pub const Domain = struct {
     size: usize,
 };
 
+/// Schema for a tensor - maps index positions to domain names
+pub const TensorSchema = struct {
+    /// Domain name for each index position
+    index_domains: []const []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *TensorSchema) void {
+        self.allocator.free(self.index_domains);
+    }
+};
+
 /// Interpreter state
 pub const Interpreter = struct {
     allocator: std.mem.Allocator,
@@ -67,6 +78,8 @@ pub const Interpreter = struct {
     tensors: std.StringHashMap(Tensor),
     /// Domain sizes
     domains: std.StringHashMap(usize),
+    /// Tensor schemas (variable to domain bindings)
+    schemas: std.StringHashMap(TensorSchema),
     /// Default domain size (for undeclared domains)
     default_domain_size: usize,
 
@@ -75,6 +88,7 @@ pub const Interpreter = struct {
             .allocator = allocator,
             .tensors = std.StringHashMap(Tensor).init(allocator),
             .domains = std.StringHashMap(usize).init(allocator),
+            .schemas = std.StringHashMap(TensorSchema).init(allocator),
             .default_domain_size = 100, // Default domain size
         };
     }
@@ -87,6 +101,13 @@ pub const Interpreter = struct {
         }
         self.tensors.deinit();
         self.domains.deinit();
+
+        var schema_iter = self.schemas.valueIterator();
+        while (schema_iter.next()) |s| {
+            var schema_copy = s.*;
+            schema_copy.deinit();
+        }
+        self.schemas.deinit();
     }
 
     /// Define a domain with a specific size
@@ -97,6 +118,19 @@ pub const Interpreter = struct {
     /// Get domain size (returns default if not defined)
     pub fn getDomainSize(self: *Interpreter, name: []const u8) usize {
         return self.domains.get(name) orelse self.default_domain_size;
+    }
+
+    /// Get domain size for a variable in a tensor context
+    /// Looks up the schema if available, otherwise falls back to domain lookup
+    pub fn getIndexDomainSize(self: *Interpreter, tensor_name: []const u8, var_name: []const u8, position: usize) usize {
+        // First, check if there's a schema for this tensor
+        if (self.schemas.get(tensor_name)) |schema| {
+            if (position < schema.index_domains.len) {
+                return self.getDomainSize(schema.index_domains[position]);
+            }
+        }
+        // Fall back to looking up the variable name as a domain
+        return self.getDomainSize(var_name);
     }
 
     /// Define a tensor with given shape
@@ -130,17 +164,30 @@ pub const Interpreter = struct {
                 }
             },
             .sparse_decl => |s| {
-                // Determine shape from indices
+                // Skip if tensor already exists (idempotent declaration)
+                if (self.tensors.contains(s.name)) {
+                    return;
+                }
+
+                // Determine shape from indices and build schema
                 var shape = std.ArrayListUnmanaged(usize){};
                 defer shape.deinit(self.allocator);
 
+                var index_domains = std.ArrayListUnmanaged([]const u8){};
+
                 for (s.indices) |idx| {
-                    const size = if (idx.domain) |domain|
-                        self.getDomainSize(domain)
-                    else
-                        self.default_domain_size;
+                    const domain = idx.domain orelse idx.name; // Use variable name as domain if not specified
+                    const size = self.getDomainSize(domain);
                     shape.append(self.allocator, size) catch return InterpreterError.OutOfMemory;
+                    index_domains.append(self.allocator, domain) catch return InterpreterError.OutOfMemory;
                 }
+
+                // Register schema for this tensor
+                const schema = TensorSchema{
+                    .index_domains = index_domains.toOwnedSlice(self.allocator) catch return InterpreterError.OutOfMemory,
+                    .allocator = self.allocator,
+                };
+                self.schemas.put(s.name, schema) catch return InterpreterError.OutOfMemory;
 
                 try self.defineTensor(s.name, shape.items, s.is_boolean);
             },
@@ -189,11 +236,11 @@ pub const Interpreter = struct {
         var output_indices = std.ArrayListUnmanaged([]const u8){};
         defer output_indices.deinit(self.allocator);
 
-        for (eq.lhs.indices) |idx| {
+        for (eq.lhs.indices, 0..) |idx, pos| {
             const size = switch (idx) {
-                .name => |n| self.getDomainSize(n),
+                .name => |n| self.getIndexDomainSize(eq.lhs.name, n, pos),
                 .constant => |c| @as(usize, @intCast(c)) + 1,
-                .primed => |p| self.getDomainSize(p),
+                .primed => |p| self.getIndexDomainSize(eq.lhs.name, p, pos),
                 else => self.default_domain_size,
             };
             shape.append(self.allocator, size) catch return InterpreterError.OutOfMemory;
@@ -441,10 +488,10 @@ pub const Interpreter = struct {
                     var shape = std.ArrayListUnmanaged(usize){};
                     defer shape.deinit(self.allocator);
 
-                    for (ref.indices) |idx| {
+                    for (ref.indices, 0..) |idx, pos| {
                         const size = switch (idx) {
-                            .name => |n| self.getDomainSize(n),
-                            .primed => |p| self.getDomainSize(p),
+                            .name => |n| self.getIndexDomainSize(ref.name, n, pos),
+                            .primed => |p| self.getIndexDomainSize(ref.name, p, pos),
                             else => self.default_domain_size,
                         };
                         shape.append(self.allocator, size) catch return InterpreterError.OutOfMemory;
@@ -604,8 +651,8 @@ pub const Interpreter = struct {
             // Create tensor if it doesn't exist
             var shape = std.ArrayListUnmanaged(usize){};
             defer shape.deinit(self.allocator);
-            for (ref0.indices) |idx| {
-                const size = if (getIndexName(idx)) |n| self.getDomainSize(n) else self.default_domain_size;
+            for (ref0.indices, 0..) |idx, pos| {
+                const size = if (getIndexName(idx)) |n| self.getIndexDomainSize(ref0.name, n, pos) else self.default_domain_size;
                 shape.append(self.allocator, size) catch return InterpreterError.OutOfMemory;
             }
             self.defineTensor(ref0.name, shape.items, ref0.is_boolean) catch return InterpreterError.OutOfMemory;
@@ -615,8 +662,8 @@ pub const Interpreter = struct {
         const t1 = self.tensors.get(ref1.name) orelse blk: {
             var shape = std.ArrayListUnmanaged(usize){};
             defer shape.deinit(self.allocator);
-            for (ref1.indices) |idx| {
-                const size = if (getIndexName(idx)) |n| self.getDomainSize(n) else self.default_domain_size;
+            for (ref1.indices, 0..) |idx, pos| {
+                const size = if (getIndexName(idx)) |n| self.getIndexDomainSize(ref1.name, n, pos) else self.default_domain_size;
                 shape.append(self.allocator, size) catch return InterpreterError.OutOfMemory;
             }
             self.defineTensor(ref1.name, shape.items, ref1.is_boolean) catch return InterpreterError.OutOfMemory;

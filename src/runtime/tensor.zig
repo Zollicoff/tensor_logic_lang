@@ -292,6 +292,35 @@ pub fn sparseRelation(allocator: std.mem.Allocator, shape_dims: []const usize) !
     return Tensor{ .bool_sparse = try SparseTensor(bool).init(allocator, shape_dims) };
 }
 
+/// Create a sparse f64 tensor
+pub fn sparseF64(allocator: std.mem.Allocator, shape_dims: []const usize) !Tensor {
+    return Tensor{ .f64_sparse = try SparseTensor(f64).init(allocator, shape_dims) };
+}
+
+/// Count non-zero elements in a tensor
+pub fn countNonZero(t: *const Tensor) usize {
+    return switch (t.*) {
+        .f64_dense => |dense| blk: {
+            var count: usize = 0;
+            for (dense.data) |val| {
+                if (val != 0.0) count += 1;
+            }
+            break :blk count;
+        },
+        .f64_sparse => |sparse| sparse.values.items.len,
+        .bool_sparse => |sparse| sparse.values.items.len,
+        else => 0,
+    };
+}
+
+/// Calculate sparsity ratio (0.0 = all zeros, 1.0 = all non-zero)
+pub fn sparsityRatio(t: *const Tensor) f64 {
+    const nnz = countNonZero(t);
+    const total = t.shape().numel();
+    if (total == 0) return 0.0;
+    return @as(f64, @floatFromInt(nnz)) / @as(f64, @floatFromInt(total));
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
