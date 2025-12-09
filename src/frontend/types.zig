@@ -256,7 +256,7 @@ pub const TypeChecker = struct {
                 return switch (nl.func) {
                     .step => .boolean, // step produces 0 or 1
                     // All other nonlinearities produce real values
-                    .sigmoid, .relu, .tanh, .softmax, .exp, .log, .abs, .sqrt, .sin, .cos, .norm => .real,
+                    .sigmoid, .relu, .tanh, .softmax, .exp, .log, .abs, .sqrt, .sin, .cos, .norm, .lnorm, .concat => .real,
                 };
             },
 

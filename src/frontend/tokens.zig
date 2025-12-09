@@ -63,6 +63,8 @@ pub const TokenType = enum {
     kw_sin,
     kw_cos,
     kw_norm,
+    kw_lnorm, // layer normalization
+    kw_concat, // concatenation
     kw_embed, // embedding lookup
     kw_sparse, // sparse tensor declaration
     kw_domain, // domain declaration
@@ -142,6 +144,8 @@ pub const TokenType = enum {
             .kw_sin => "sin",
             .kw_cos => "cos",
             .kw_norm => "norm",
+            .kw_lnorm => "lnorm",
+            .kw_concat => "concat",
             .kw_embed => "embed",
             .kw_sparse => "sparse",
             .kw_domain => "domain",
@@ -222,6 +226,8 @@ pub const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "sin", .kw_sin },
     .{ "cos", .kw_cos },
     .{ "norm", .kw_norm },
+    .{ "lnorm", .kw_lnorm },
+    .{ "concat", .kw_concat },
     .{ "embed", .kw_embed },
     .{ "sparse", .kw_sparse },
     .{ "domain", .kw_domain },

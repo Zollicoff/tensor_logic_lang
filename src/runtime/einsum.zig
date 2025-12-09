@@ -789,6 +789,55 @@ pub fn cosTensor(t: *DenseTensor(f64)) void {
     }
 }
 
+/// Layer Normalization: (x - mean) / sqrt(var + eps)
+/// Normalizes over the last axis for 2D tensors, or the full tensor for 1D
+const LNORM_EPS: f64 = 1e-5;
+
+/// Apply layer norm to a 1D slice
+fn layerNorm1D(data: []f64) void {
+    if (data.len == 0) return;
+
+    // Compute mean
+    var sum: f64 = 0.0;
+    for (data) |x| {
+        sum += x;
+    }
+    const mean = sum / @as(f64, @floatFromInt(data.len));
+
+    // Compute variance
+    var var_sum: f64 = 0.0;
+    for (data) |x| {
+        const diff = x - mean;
+        var_sum += diff * diff;
+    }
+    const variance = var_sum / @as(f64, @floatFromInt(data.len));
+
+    // Normalize
+    const std_dev = @sqrt(variance + LNORM_EPS);
+    for (data) |*x| {
+        x.* = (x.* - mean) / std_dev;
+    }
+}
+
+/// Apply layer normalization to tensor
+/// For 1D: normalizes the entire tensor
+/// For 2D: normalizes each row (last axis)
+pub fn lnormTensor(t: *DenseTensor(f64)) void {
+    if (t.shape.rank() == 1) {
+        layerNorm1D(t.data);
+    } else if (t.shape.rank() == 2) {
+        const rows = t.shape.dims[0];
+        const cols = t.shape.dims[1];
+        for (0..rows) |i| {
+            const start = i * cols;
+            const end = start + cols;
+            layerNorm1D(t.data[start..end]);
+        }
+    }
+    // Higher rank tensors: normalize over the last axis
+    // TODO: implement for rank > 2
+}
+
 // ============================================================================
 // Broadcasting Operations
 // ============================================================================

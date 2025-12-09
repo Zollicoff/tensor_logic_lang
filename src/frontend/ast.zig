@@ -137,6 +137,8 @@ pub const Nonlinearity = enum {
     sin, // sin(x)
     cos, // cos(x)
     norm, // ||x||
+    lnorm, // layer normalization: (x - mean) / std
+    concat, // concatenation along last axis
 };
 
 /// Accumulation operators (how to combine multiple equations for same LHS)

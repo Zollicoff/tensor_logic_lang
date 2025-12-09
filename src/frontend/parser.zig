@@ -631,6 +631,8 @@ pub const Parser = struct {
         if (self.match(.kw_sin)) return .sin;
         if (self.match(.kw_cos)) return .cos;
         if (self.match(.kw_norm)) return .norm;
+        if (self.match(.kw_lnorm)) return .lnorm;
+        if (self.match(.kw_concat)) return .concat;
         return null;
     }
 

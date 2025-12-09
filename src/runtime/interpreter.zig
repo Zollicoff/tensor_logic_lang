@@ -1036,10 +1036,12 @@ pub const Interpreter = struct {
                 var has_virtual = false;
                 var has_arithmetic = false;
                 var has_slice = false;
+                var has_div = false;
                 for (ref.indices) |idx| {
                     if (idx == .virtual) has_virtual = true;
                     if (idx == .arithmetic) has_arithmetic = true;
                     if (idx == .slice) has_slice = true;
+                    if (idx == .div) has_div = true;
                 }
 
                 if (has_virtual) {
@@ -1055,6 +1057,11 @@ pub const Interpreter = struct {
                 if (has_slice) {
                     // Perform slice extraction
                     return try self.evaluateSlice(ref);
+                }
+
+                if (has_div) {
+                    // Perform division/pooling index access
+                    return try self.evaluateDivisionIndex(ref);
                 }
 
                 if (self.tensors.get(ref.name)) |t| {
@@ -1150,6 +1157,8 @@ pub const Interpreter = struct {
                                     .sin => einsum.sinTensor(dense),
                                     .cos => einsum.cosTensor(dense),
                                     .norm => {}, // TODO: implement norm
+                                    .lnorm => einsum.lnormTensor(dense),
+                                    .concat => {}, // Concat needs multiple tensors, no-op on single
                                 }
                             },
                             .f64_sparse => |*sparse| {
@@ -1176,7 +1185,7 @@ pub const Interpreter = struct {
                             .sqrt => einsum.sqrt_fn(v.*),
                             .sin => einsum.sin_fn(v.*),
                             .cos => einsum.cos_fn(v.*),
-                            .softmax, .norm => v.*, // No-op for scalars
+                            .softmax, .norm, .lnorm, .concat => v.*, // No-op for scalars
                         };
                     },
                     else => {},
@@ -1371,6 +1380,87 @@ pub const Interpreter = struct {
                 }
             },
         }
+    }
+
+    /// Evaluate a tensor reference with division indices (for pooling)
+    /// E.g., X[i/2] creates a downsampled tensor for pooling operations
+    /// This expands each output position to cover multiple input positions
+    fn evaluateDivisionIndex(self: *Interpreter, ref: ast.TensorRef) InterpreterError!Value {
+        // Get the source tensor
+        const src_tensor = self.tensors.get(ref.name) orelse return InterpreterError.UndefinedTensor;
+
+        // Only support f64_dense for now
+        if (src_tensor != .f64_dense) {
+            return InterpreterError.NotImplemented;
+        }
+        const src = src_tensor.f64_dense;
+
+        // Handle 1D case: X[i/d] -> result with size ceil(n/d)
+        if (ref.indices.len == 1 and src.shape.rank() == 1) {
+            const idx = ref.indices[0];
+            if (idx == .div) {
+                const divisor: usize = @intCast(idx.div.divisor);
+                if (divisor == 0) return InterpreterError.NotImplemented;
+
+                const n = src.shape.dims[0];
+                const out_size = (n + divisor - 1) / divisor; // ceil division
+
+                var result = DenseTensor(f64).init(self.allocator, &[_]usize{out_size}) catch return InterpreterError.OutOfMemory;
+                result.fill(0.0);
+
+                // For pooling, we replicate each output position
+                // The actual pooling (max, avg, etc.) happens via accumulation operators
+                // Here we just return the first element of each pool
+                for (0..out_size) |out_i| {
+                    const in_i = out_i * divisor;
+                    if (in_i < n) {
+                        result.data[out_i] = src.data[in_i];
+                    }
+                }
+
+                return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+            }
+        }
+
+        // Handle 2D case: X[i/d1, j/d2] -> downsampled result
+        if (ref.indices.len == 2 and src.shape.rank() == 2) {
+            const idx0 = ref.indices[0];
+            const idx1 = ref.indices[1];
+
+            var div0: usize = 1;
+            var div1: usize = 1;
+
+            if (idx0 == .div) div0 = @intCast(idx0.div.divisor);
+            if (idx1 == .div) div1 = @intCast(idx1.div.divisor);
+
+            if (div0 == 0 or div1 == 0) return InterpreterError.NotImplemented;
+
+            const rows = src.shape.dims[0];
+            const cols = src.shape.dims[1];
+            const out_rows = (rows + div0 - 1) / div0;
+            const out_cols = (cols + div1 - 1) / div1;
+
+            var result = DenseTensor(f64).init(self.allocator, &[_]usize{ out_rows, out_cols }) catch return InterpreterError.OutOfMemory;
+            result.fill(0.0);
+
+            // Sample first element of each pool region
+            for (0..out_rows) |out_i| {
+                const in_i = out_i * div0;
+                if (in_i >= rows) continue;
+                for (0..out_cols) |out_j| {
+                    const in_j = out_j * div1;
+                    if (in_j >= cols) continue;
+                    result.data[out_i * out_cols + out_j] = src.data[in_i * cols + in_j];
+                }
+            }
+
+            return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+        }
+
+        // Fallback: just return a copy
+        const new_dense = DenseTensor(f64).init(self.allocator, src.shape.dims) catch return InterpreterError.OutOfMemory;
+        @memcpy(new_dense.data, src.data);
+        return Value{ .tensor_val = Tensor{ .f64_dense = new_dense } };
     }
 
     /// Evaluate a tensor reference with slice indices

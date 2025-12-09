@@ -261,7 +261,7 @@ pub const Optimizer = struct {
             .sqrt => if (x >= 0) @sqrt(x) else return null,
             .sin => @sin(x),
             .cos => @cos(x),
-            .softmax, .norm => return null, // Can't fold these for scalars
+            .softmax, .norm, .lnorm, .concat => return null, // Can't fold these for scalars
         };
 
         return .{ .float = result };
