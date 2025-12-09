@@ -41,18 +41,27 @@ pub fn main() !void {
             std.debug.print("Error: 'run' command requires a file path\n", .{});
             return;
         }
-        // Check for --fixpoint or -f flag
+        // Parse flags: -f/--fixpoint, -t/--trace
         var use_fixpoint = false;
-        var file_path: []const u8 = args[2];
-        if (args.len >= 4) {
-            if (std.mem.eql(u8, args[2], "--fixpoint") or std.mem.eql(u8, args[2], "-f")) {
+        var use_trace = false;
+        var file_path: ?[]const u8 = null;
+
+        for (args[2..]) |arg| {
+            if (std.mem.eql(u8, arg, "--fixpoint") or std.mem.eql(u8, arg, "-f")) {
                 use_fixpoint = true;
-                file_path = args[3];
-            } else if (std.mem.eql(u8, args[3], "--fixpoint") or std.mem.eql(u8, args[3], "-f")) {
-                use_fixpoint = true;
+            } else if (std.mem.eql(u8, arg, "--trace") or std.mem.eql(u8, arg, "-t")) {
+                use_trace = true;
+            } else if (file_path == null) {
+                file_path = arg;
             }
         }
-        try runFile(allocator, file_path, use_fixpoint);
+
+        if (file_path) |path| {
+            try runFile(allocator, path, use_fixpoint, use_trace);
+        } else {
+            std.debug.print("Error: 'run' command requires a file path\n", .{});
+            return;
+        }
     } else if (std.mem.eql(u8, command, "repl")) {
         try runRepl(allocator);
     } else if (std.mem.eql(u8, command, "check")) {
@@ -67,7 +76,7 @@ pub fn main() !void {
         try printVersion();
     } else {
         // Assume it's a file path
-        try runFile(allocator, command, false);
+        try runFile(allocator, command, false, false);
     }
 }
 
@@ -93,6 +102,7 @@ fn printUsage() !void {
         \\
         \\Options:
         \\  -f, --fixpoint       Run until convergence (for recursive rules like Ancestor)
+        \\  -t, --trace          Enable trace mode (print execution details to stderr)
         \\
         \\Examples:
         \\  tlc repl
@@ -683,7 +693,7 @@ fn checkFile(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 }
 
-fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool) !void {
+fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool, use_trace: bool) !void {
     const stdout = std.fs.File.stdout();
 
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
@@ -722,6 +732,12 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool) !
     // Execute
     var interp = interpreter.Interpreter.init(allocator);
     defer interp.deinit();
+
+    // Enable trace mode if requested
+    if (use_trace) {
+        interp.setTrace(true);
+        stdout.writeAll("Trace mode enabled\n") catch {};
+    }
 
     if (use_fixpoint) {
         const msg1 = std.fmt.allocPrint(allocator, "Running {s} with fixpoint iteration...\n", .{path}) catch return;

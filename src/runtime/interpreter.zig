@@ -89,6 +89,8 @@ pub const Interpreter = struct {
     default_domain_size: usize,
     /// Last executed program (for REPL fixpoint)
     last_program: ?*const ast.Program,
+    /// Trace mode: print execution details
+    trace_enabled: bool,
 
     pub fn init(allocator: std.mem.Allocator) Interpreter {
         return Interpreter{
@@ -98,7 +100,23 @@ pub const Interpreter = struct {
             .schemas = std.StringHashMap(TensorSchema).init(allocator),
             .default_domain_size = 100, // Default domain size
             .last_program = null,
+            .trace_enabled = false,
         };
+    }
+
+    /// Enable or disable trace mode
+    pub fn setTrace(self: *Interpreter, enabled: bool) void {
+        self.trace_enabled = enabled;
+    }
+
+    /// Print trace message if tracing is enabled
+    fn trace(self: *Interpreter, comptime fmt: []const u8, args: anytype) void {
+        if (self.trace_enabled) {
+            const stderr = std.fs.File.stderr();
+            var buf: [1024]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "[TRACE] " ++ fmt ++ "\n", args) catch return;
+            stderr.writeAll(msg) catch {};
+        }
     }
 
     pub fn deinit(self: *Interpreter) void {
@@ -174,17 +192,23 @@ pub const Interpreter = struct {
     /// Execute a single statement
     pub fn executeStatement(self: *Interpreter, stmt: *const ast.Statement) !void {
         switch (stmt.*) {
-            .equation => |eq| try self.executeEquation(&eq),
+            .equation => |eq| {
+                self.trace("Executing equation: {s}", .{eq.lhs.name});
+                try self.executeEquation(&eq);
+            },
             .domain_decl => |d| {
                 if (d.size) |size| {
+                    self.trace("Declaring domain: {s} = {d}", .{ d.name, size });
                     try self.defineDomain(d.name, @intCast(size));
                 }
             },
             .sparse_decl => |s| {
                 // Skip if tensor already exists (idempotent declaration)
                 if (self.tensors.contains(s.name)) {
+                    self.trace("Sparse tensor {s} already exists, skipping", .{s.name});
                     return;
                 }
+                self.trace("Declaring sparse tensor: {s} with {d} indices", .{ s.name, s.indices.len });
 
                 // Determine shape from indices and build schema
                 var shape = std.ArrayListUnmanaged(usize){};
@@ -209,6 +233,7 @@ pub const Interpreter = struct {
                 try self.defineTensor(s.name, shape.items, s.is_boolean);
             },
             .import_stmt => |im| {
+                self.trace("Importing: {s}", .{im.path});
                 try self.executeImport(im.path, im.alias);
             },
             .export_stmt => |ex| {
@@ -279,6 +304,8 @@ pub const Interpreter = struct {
 
     /// Execute a tensor equation
     fn executeEquation(self: *Interpreter, eq: *const ast.Equation) !void {
+        self.trace("  LHS: {s}[{d} indices], op: {s}", .{ eq.lhs.name, eq.lhs.indices.len, @tagName(eq.op) });
+
         // Check if this is an element-wise assignment (all constant indices)
         var all_constant = true;
         var element_indices = std.ArrayListUnmanaged(usize){};
