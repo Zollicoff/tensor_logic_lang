@@ -253,6 +253,267 @@ fn einsumLoop(
 }
 
 // ============================================================================
+// Sparse Einsum Operations
+// ============================================================================
+
+/// Sparse-sparse einsum for two operands
+/// C[out_indices] = A[a_indices] B[b_indices]
+/// Only iterates over non-zero entries - much faster for sparse tensors!
+pub fn sparseEinsum2(
+    allocator: std.mem.Allocator,
+    a: *const SparseTensor(f64),
+    a_indices: []const []const u8,
+    b: *const SparseTensor(f64),
+    b_indices: []const []const u8,
+    out_indices: []const []const u8,
+) !SparseTensor(f64) {
+    // Build index -> size mapping from shapes
+    var index_size = std.StringHashMap(usize).init(allocator);
+    defer index_size.deinit();
+
+    for (a_indices, 0..) |idx, dim| {
+        try index_size.put(idx, a.shape.dims[dim]);
+    }
+    for (b_indices, 0..) |idx, dim| {
+        if (!index_size.contains(idx)) {
+            try index_size.put(idx, b.shape.dims[dim]);
+        }
+    }
+
+    // Determine output shape
+    var out_shape = try allocator.alloc(usize, out_indices.len);
+    defer allocator.free(out_shape);
+    for (out_indices, 0..) |idx, i| {
+        out_shape[i] = index_size.get(idx) orelse 1;
+    }
+
+    // Find contracted indices (in both A and B but not in output)
+    var contracted = std.ArrayListUnmanaged([]const u8){};
+    defer contracted.deinit(allocator);
+
+    for (a_indices) |a_idx| {
+        var in_b = false;
+        for (b_indices) |b_idx| {
+            if (std.mem.eql(u8, a_idx, b_idx)) {
+                in_b = true;
+                break;
+            }
+        }
+        if (in_b) {
+            // Check if it's in output
+            var in_out = false;
+            for (out_indices) |o_idx| {
+                if (std.mem.eql(u8, a_idx, o_idx)) {
+                    in_out = true;
+                    break;
+                }
+            }
+            if (!in_out) {
+                try contracted.append(allocator, a_idx);
+            }
+        }
+    }
+
+    // Create output sparse tensor
+    var c = try SparseTensor(f64).init(allocator, out_shape);
+
+    // Sparse einsum: iterate only over non-zero entries in A
+    // For each non-zero A[...], find matching non-zeros in B
+    var iter_a = a.iterator();
+    while (iter_a.next()) |entry_a| {
+        // Extract A's index values for each index name
+        var a_idx_map = std.StringHashMap(usize).init(allocator);
+        defer a_idx_map.deinit();
+        for (a_indices, 0..) |idx_name, dim| {
+            try a_idx_map.put(idx_name, entry_a.indices[dim]);
+        }
+
+        // Find matching entries in B
+        var iter_b = b.iterator();
+        while (iter_b.next()) |entry_b| {
+            // Extract B's index values
+            var b_idx_map = std.StringHashMap(usize).init(allocator);
+            defer b_idx_map.deinit();
+            for (b_indices, 0..) |idx_name, dim| {
+                try b_idx_map.put(idx_name, entry_b.indices[dim]);
+            }
+
+            // Check if contracted indices match
+            var matches = true;
+            for (contracted.items) |contr_idx| {
+                const a_val = a_idx_map.get(contr_idx);
+                const b_val = b_idx_map.get(contr_idx);
+                if (a_val != null and b_val != null and a_val.? != b_val.?) {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if (matches) {
+                // Compute output index
+                var c_idx = try allocator.alloc(usize, out_indices.len);
+                defer allocator.free(c_idx);
+
+                for (out_indices, 0..) |idx_name, i| {
+                    // Check A first, then B
+                    if (a_idx_map.get(idx_name)) |val| {
+                        c_idx[i] = val;
+                    } else if (b_idx_map.get(idx_name)) |val| {
+                        c_idx[i] = val;
+                    } else {
+                        c_idx[i] = 0;
+                    }
+                }
+
+                // Accumulate product
+                const prod = entry_a.value * entry_b.value;
+                const old_val = c.get(c_idx);
+                try c.set(c_idx, old_val + prod);
+            }
+        }
+    }
+
+    return c;
+}
+
+/// Sparse-dense einsum: sparse A, dense B -> sparse result
+/// Useful when A is a sparse relation and B is a dense tensor
+pub fn sparseDenseEinsum2(
+    allocator: std.mem.Allocator,
+    a: *const SparseTensor(f64),
+    a_indices: []const []const u8,
+    b: *const DenseTensor(f64),
+    b_indices: []const []const u8,
+    out_indices: []const []const u8,
+) !SparseTensor(f64) {
+    // Build index -> size mapping
+    var index_size = std.StringHashMap(usize).init(allocator);
+    defer index_size.deinit();
+
+    for (a_indices, 0..) |idx, dim| {
+        try index_size.put(idx, a.shape.dims[dim]);
+    }
+    for (b_indices, 0..) |idx, dim| {
+        if (!index_size.contains(idx)) {
+            try index_size.put(idx, b.shape.dims[dim]);
+        }
+    }
+
+    // Determine output shape
+    var out_shape = try allocator.alloc(usize, out_indices.len);
+    defer allocator.free(out_shape);
+    for (out_indices, 0..) |idx, i| {
+        out_shape[i] = index_size.get(idx) orelse 1;
+    }
+
+    // Find indices that are only in B (need to iterate over them)
+    var b_only_indices = std.ArrayListUnmanaged([]const u8){};
+    defer b_only_indices.deinit(allocator);
+
+    for (b_indices) |b_idx| {
+        var in_a = false;
+        for (a_indices) |a_idx| {
+            if (std.mem.eql(u8, b_idx, a_idx)) {
+                in_a = true;
+                break;
+            }
+        }
+        if (!in_a) {
+            try b_only_indices.append(allocator, b_idx);
+        }
+    }
+
+    // Create output sparse tensor
+    var c = try SparseTensor(f64).init(allocator, out_shape);
+
+    // Iterate over non-zeros in A
+    var iter_a = a.iterator();
+    while (iter_a.next()) |entry_a| {
+        // Extract A's index values
+        var idx_map = std.StringHashMap(usize).init(allocator);
+        defer idx_map.deinit();
+        for (a_indices, 0..) |idx_name, dim| {
+            try idx_map.put(idx_name, entry_a.indices[dim]);
+        }
+
+        // For indices only in B, we need to iterate over all their values
+        // This is a multi-dimensional iteration
+        try sparseIterateB(allocator, &c, entry_a.value, &idx_map, b, b_indices, out_indices, &index_size, b_only_indices.items, 0);
+    }
+
+    return c;
+}
+
+/// Helper for sparseDenseEinsum2: recursively iterate over B-only indices
+fn sparseIterateB(
+    allocator: std.mem.Allocator,
+    c: *SparseTensor(f64),
+    a_val: f64,
+    idx_map: *std.StringHashMap(usize),
+    b: *const DenseTensor(f64),
+    b_indices: []const []const u8,
+    out_indices: []const []const u8,
+    index_size: *std.StringHashMap(usize),
+    b_only: []const []const u8,
+    depth: usize,
+) !void {
+    if (depth >= b_only.len) {
+        // All B-only indices are set, compute the product
+        var b_idx = try allocator.alloc(usize, b_indices.len);
+        defer allocator.free(b_idx);
+        for (b_indices, 0..) |idx_name, i| {
+            b_idx[i] = idx_map.get(idx_name) orelse 0;
+        }
+
+        const b_val = b.get(b_idx);
+        if (b_val != 0.0) {
+            // Compute output index
+            var c_idx = try allocator.alloc(usize, out_indices.len);
+            defer allocator.free(c_idx);
+            for (out_indices, 0..) |idx_name, i| {
+                c_idx[i] = idx_map.get(idx_name) orelse 0;
+            }
+
+            const old_val = c.get(c_idx);
+            try c.set(c_idx, old_val + a_val * b_val);
+        }
+        return;
+    }
+
+    // Iterate over all values of b_only[depth]
+    const idx_name = b_only[depth];
+    const size = index_size.get(idx_name) orelse 1;
+
+    for (0..size) |val| {
+        try idx_map.put(idx_name, val);
+        try sparseIterateB(allocator, c, a_val, idx_map, b, b_indices, out_indices, index_size, b_only, depth + 1);
+    }
+}
+
+/// Apply step function to sparse tensor (keeps sparsity)
+pub fn stepSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = step(v.*);
+    }
+    // Note: step(x) returns 0 for x <= 0, so we should compact
+    // But for simplicity, we keep all entries (values become 0 or 1)
+}
+
+/// Apply ReLU to sparse tensor
+pub fn reluSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = relu(v.*);
+    }
+}
+
+/// Apply sigmoid to sparse tensor
+pub fn sigmoidSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = sigmoid(v.*);
+    }
+}
+
+// ============================================================================
 // Nonlinearity functions (activation functions)
 // ============================================================================
 
@@ -566,4 +827,83 @@ test "softmax 2D" {
     // Uniform input should give uniform output
     try std.testing.expectApproxEqAbs(t.data[3], t.data[4], 0.0001);
     try std.testing.expectApproxEqAbs(t.data[4], t.data[5], 0.0001);
+}
+
+test "sparse einsum matmul" {
+    // Test sparse matrix multiplication: C[i,k] = A[i,j] B[j,k]
+    // A = [[1, 0], [0, 2]] (sparse diagonal-ish)
+    // B = [[3, 0], [0, 4]] (sparse diagonal)
+    // C = A @ B = [[3, 0], [0, 8]]
+    const allocator = std.testing.allocator;
+
+    var a = try SparseTensor(f64).init(allocator, &[_]usize{ 2, 2 });
+    defer a.deinit();
+    try a.set(&[_]usize{ 0, 0 }, 1.0);
+    try a.set(&[_]usize{ 1, 1 }, 2.0);
+
+    var b = try SparseTensor(f64).init(allocator, &[_]usize{ 2, 2 });
+    defer b.deinit();
+    try b.set(&[_]usize{ 0, 0 }, 3.0);
+    try b.set(&[_]usize{ 1, 1 }, 4.0);
+
+    const a_indices = [_][]const u8{ "i", "j" };
+    const b_indices = [_][]const u8{ "j", "k" };
+    const out_indices = [_][]const u8{ "i", "k" };
+
+    var c = try sparseEinsum2(allocator, &a, &a_indices, &b, &b_indices, &out_indices);
+    defer c.deinit();
+
+    // C should have 2 non-zeros: [0,0]=3, [1,1]=8
+    try std.testing.expectEqual(@as(usize, 2), c.nnz());
+    try std.testing.expectEqual(@as(f64, 3.0), c.get(&[_]usize{ 0, 0 }));
+    try std.testing.expectEqual(@as(f64, 8.0), c.get(&[_]usize{ 1, 1 }));
+    try std.testing.expectEqual(@as(f64, 0.0), c.get(&[_]usize{ 0, 1 }));
+}
+
+test "sparse einsum transitive closure" {
+    // Test transitive closure: Ancestor[i,k] = Parent[i,j] Ancestor[j,k]
+    // Parent = {(0,1), (1,2)} means 0->1->2
+    // After one iteration with initial Ancestor = Parent:
+    // Ancestor[0,2] = Parent[0,1] * Ancestor[1,2] = 1 * 1 = 1
+    const allocator = std.testing.allocator;
+
+    var parent = try SparseTensor(f64).init(allocator, &[_]usize{ 3, 3 });
+    defer parent.deinit();
+    try parent.set(&[_]usize{ 0, 1 }, 1.0);
+    try parent.set(&[_]usize{ 1, 2 }, 1.0);
+
+    var ancestor = try SparseTensor(f64).init(allocator, &[_]usize{ 3, 3 });
+    defer ancestor.deinit();
+    try ancestor.set(&[_]usize{ 0, 1 }, 1.0);
+    try ancestor.set(&[_]usize{ 1, 2 }, 1.0);
+
+    // Compute: Result[i,k] = Parent[i,j] Ancestor[j,k]
+    const p_indices = [_][]const u8{ "i", "j" };
+    const a_indices = [_][]const u8{ "j", "k" };
+    const out_indices = [_][]const u8{ "i", "k" };
+
+    var result = try sparseEinsum2(allocator, &parent, &p_indices, &ancestor, &a_indices, &out_indices);
+    defer result.deinit();
+
+    // Result should have (0,2) = 1.0 from Parent[0,1] * Ancestor[1,2]
+    try std.testing.expectEqual(@as(f64, 1.0), result.get(&[_]usize{ 0, 2 }));
+    // Direct parent relations should also be there
+    try std.testing.expectEqual(@as(f64, 0.0), result.get(&[_]usize{ 0, 0 })); // No self-loop
+}
+
+test "sparse step function" {
+    const allocator = std.testing.allocator;
+
+    var t = try SparseTensor(f64).init(allocator, &[_]usize{ 3, 3 });
+    defer t.deinit();
+
+    try t.set(&[_]usize{ 0, 0 }, 0.5);
+    try t.set(&[_]usize{ 1, 1 }, -0.3);
+    try t.set(&[_]usize{ 2, 2 }, 2.0);
+
+    stepSparseTensor(&t);
+
+    try std.testing.expectEqual(@as(f64, 1.0), t.get(&[_]usize{ 0, 0 }));
+    try std.testing.expectEqual(@as(f64, 0.0), t.get(&[_]usize{ 1, 1 }));
+    try std.testing.expectEqual(@as(f64, 1.0), t.get(&[_]usize{ 2, 2 }));
 }

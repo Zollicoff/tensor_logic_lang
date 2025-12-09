@@ -217,6 +217,112 @@ pub fn SparseTensor(comptime T: type) type {
             }
             return true;
         }
+
+        /// Clone the sparse tensor
+        pub fn clone(self: *const Self) !Self {
+            var new_tensor = try Self.init(self.allocator, self.shape.dims);
+
+            for (self.indices.items, self.values.items) |idx, val| {
+                try new_tensor.set(idx, val);
+            }
+
+            return new_tensor;
+        }
+
+        /// Convert to dense tensor
+        pub fn toDense(self: *const Self, allocator: std.mem.Allocator) !DenseTensor(T) {
+            var dense = try DenseTensor(T).init(allocator, self.shape.dims);
+
+            for (self.indices.items, self.values.items) |idx, val| {
+                dense.set(idx, val);
+            }
+
+            return dense;
+        }
+
+        /// Create sparse tensor from dense (only keeping non-zeros)
+        pub fn fromDense(allocator: std.mem.Allocator, dense: *const DenseTensor(T)) !Self {
+            var sparse = try Self.init(allocator, dense.shape.dims);
+
+            // Iterate through all elements and add non-zeros
+            const numel = dense.shape.numel();
+            const rank = dense.shape.dims.len;
+
+            // Pre-compute strides
+            var strides = try allocator.alloc(usize, rank);
+            defer allocator.free(strides);
+            var stride: usize = 1;
+            var i = rank;
+            while (i > 0) {
+                i -= 1;
+                strides[i] = stride;
+                stride *= dense.shape.dims[i];
+            }
+
+            var flat_idx: usize = 0;
+            while (flat_idx < numel) : (flat_idx += 1) {
+                const val = dense.data[flat_idx];
+                if (val != std.mem.zeroes(T)) {
+                    // Convert flat index to multi-index
+                    var multi_idx = try allocator.alloc(usize, rank);
+                    defer allocator.free(multi_idx);
+
+                    var remaining = flat_idx;
+                    for (0..rank) |d| {
+                        multi_idx[d] = remaining / strides[d];
+                        remaining = remaining % strides[d];
+                    }
+
+                    try sparse.set(multi_idx, val);
+                }
+            }
+
+            return sparse;
+        }
+
+        /// Remove zero entries (useful after operations that might create zeros)
+        pub fn compact(self: *Self) void {
+            var write_idx: usize = 0;
+            for (self.indices.items, self.values.items, 0..) |idx, val, read_idx| {
+                if (val != std.mem.zeroes(T)) {
+                    if (write_idx != read_idx) {
+                        self.indices.items[write_idx] = idx;
+                        self.values.items[write_idx] = val;
+                    }
+                    write_idx += 1;
+                } else {
+                    // Free the index array for removed entries
+                    self.allocator.free(idx);
+                }
+            }
+            self.indices.shrinkRetainingCapacity(write_idx);
+            self.values.shrinkRetainingCapacity(write_idx);
+        }
+
+        /// Iterator over non-zero entries
+        pub const Entry = struct {
+            indices: []const usize,
+            value: T,
+        };
+
+        pub fn iterator(self: *const Self) Iterator {
+            return Iterator{ .tensor = self, .pos = 0 };
+        }
+
+        pub const Iterator = struct {
+            tensor: *const Self,
+            pos: usize,
+
+            pub fn next(self: *Iterator) ?Entry {
+                if (self.pos >= self.tensor.values.items.len) return null;
+                const entry = Entry{
+                    .indices = self.tensor.indices.items[self.pos],
+                    .value = self.tensor.values.items[self.pos],
+                };
+                self.pos += 1;
+                return entry;
+            }
+        };
     };
 }
 
@@ -372,4 +478,80 @@ test "tensor union" {
 
     try std.testing.expectEqual(DType.float64, t.dtype());
     try std.testing.expectEqual(false, t.isSparse());
+}
+
+test "sparse tensor clone" {
+    const allocator = std.testing.allocator;
+
+    var t = try SparseTensor(f64).init(allocator, &[_]usize{ 10, 10 });
+    defer t.deinit();
+
+    try t.set(&[_]usize{ 1, 2 }, 3.0);
+    try t.set(&[_]usize{ 5, 7 }, 9.0);
+
+    var clone = try t.clone();
+    defer clone.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), clone.nnz());
+    try std.testing.expectEqual(@as(f64, 3.0), clone.get(&[_]usize{ 1, 2 }));
+    try std.testing.expectEqual(@as(f64, 9.0), clone.get(&[_]usize{ 5, 7 }));
+}
+
+test "sparse to dense conversion" {
+    const allocator = std.testing.allocator;
+
+    var sparse = try SparseTensor(f64).init(allocator, &[_]usize{ 3, 3 });
+    defer sparse.deinit();
+
+    try sparse.set(&[_]usize{ 0, 0 }, 1.0);
+    try sparse.set(&[_]usize{ 1, 1 }, 2.0);
+    try sparse.set(&[_]usize{ 2, 2 }, 3.0);
+
+    var dense = try sparse.toDense(allocator);
+    defer dense.deinit();
+
+    try std.testing.expectEqual(@as(f64, 1.0), dense.get(&[_]usize{ 0, 0 }));
+    try std.testing.expectEqual(@as(f64, 2.0), dense.get(&[_]usize{ 1, 1 }));
+    try std.testing.expectEqual(@as(f64, 3.0), dense.get(&[_]usize{ 2, 2 }));
+    try std.testing.expectEqual(@as(f64, 0.0), dense.get(&[_]usize{ 0, 1 }));
+}
+
+test "dense to sparse conversion" {
+    const allocator = std.testing.allocator;
+
+    var dense = try DenseTensor(f64).init(allocator, &[_]usize{ 3, 3 });
+    defer dense.deinit();
+
+    dense.set(&[_]usize{ 0, 0 }, 1.0);
+    dense.set(&[_]usize{ 1, 1 }, 2.0);
+    dense.set(&[_]usize{ 2, 2 }, 3.0);
+
+    var sparse = try SparseTensor(f64).fromDense(allocator, &dense);
+    defer sparse.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), sparse.nnz());
+    try std.testing.expectEqual(@as(f64, 1.0), sparse.get(&[_]usize{ 0, 0 }));
+    try std.testing.expectEqual(@as(f64, 2.0), sparse.get(&[_]usize{ 1, 1 }));
+    try std.testing.expectEqual(@as(f64, 3.0), sparse.get(&[_]usize{ 2, 2 }));
+}
+
+test "sparse tensor iterator" {
+    const allocator = std.testing.allocator;
+
+    var t = try SparseTensor(f64).init(allocator, &[_]usize{ 5, 5 });
+    defer t.deinit();
+
+    try t.set(&[_]usize{ 1, 2 }, 10.0);
+    try t.set(&[_]usize{ 3, 4 }, 20.0);
+
+    var iter = t.iterator();
+    var count: usize = 0;
+    var sum: f64 = 0.0;
+    while (iter.next()) |entry| {
+        count += 1;
+        sum += entry.value;
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(f64, 30.0), sum);
 }

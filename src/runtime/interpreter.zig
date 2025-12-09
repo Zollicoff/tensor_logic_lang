@@ -134,11 +134,18 @@ pub const Interpreter = struct {
     }
 
     /// Define a tensor with given shape
-    /// Note: For now, always use f64_dense for computation simplicity
-    /// Boolean relations use 0.0/1.0 values with step() for logic
+    /// If is_sparse is true, uses sparse storage (efficient for relations)
     pub fn defineTensor(self: *Interpreter, name: []const u8, shape: []const usize, is_sparse: bool) !void {
-        _ = is_sparse; // TODO: use sparse storage for large Boolean relations
-        const t = try tensor.zeros(self.allocator, shape);
+        const t = if (is_sparse)
+            try tensor.sparseF64(self.allocator, shape)
+        else
+            try tensor.zeros(self.allocator, shape);
+        try self.tensors.put(name, t);
+    }
+
+    /// Define a sparse tensor
+    pub fn defineSparseTensor(self: *Interpreter, name: []const u8, shape: []const usize) !void {
+        const t = try tensor.sparseF64(self.allocator, shape);
         try self.tensors.put(name, t);
     }
 
@@ -552,6 +559,15 @@ pub const Interpreter = struct {
                                     .norm => {}, // TODO: implement norm
                                 }
                             },
+                            .f64_sparse => |*sparse| {
+                                // Apply nonlinearities to sparse tensors
+                                switch (nl.func) {
+                                    .step => einsum.stepSparseTensor(sparse),
+                                    .relu => einsum.reluSparseTensor(sparse),
+                                    .sigmoid => einsum.sigmoidSparseTensor(sparse),
+                                    else => {}, // Other ops not yet implemented for sparse
+                                }
+                            },
                             else => {},
                         }
                     },
@@ -685,16 +701,6 @@ pub const Interpreter = struct {
             break :blk self.tensors.get(ref1.name).?;
         };
 
-        // Get the dense f64 tensors (only type we support for now)
-        const dense0 = switch (t0) {
-            .f64_dense => |d| d,
-            else => return InterpreterError.NotImplemented,
-        };
-        const dense1 = switch (t1) {
-            .f64_dense => |d| d,
-            else => return InterpreterError.NotImplemented,
-        };
-
         // Extract index names from tensor refs
         var indices0 = std.ArrayListUnmanaged([]const u8){};
         defer indices0.deinit(self.allocator);
@@ -712,17 +718,77 @@ pub const Interpreter = struct {
             }
         }
 
-        // Call einsum2 to perform the contraction
-        const result_dense = einsum.einsum2(
-            self.allocator,
-            &dense0,
-            indices0.items,
-            &dense1,
-            indices1.items,
-            output_indices,
-        ) catch return InterpreterError.EinsumError;
+        // Dispatch based on tensor types (sparse vs dense)
+        const is_sparse0 = t0.isSparse();
+        const is_sparse1 = t1.isSparse();
 
-        return Value{ .tensor_val = Tensor{ .f64_dense = result_dense } };
+        if (is_sparse0 and is_sparse1) {
+            // Sparse-sparse einsum
+            const sparse0 = switch (t0) {
+                .f64_sparse => |s| s,
+                else => return InterpreterError.NotImplemented,
+            };
+            const sparse1 = switch (t1) {
+                .f64_sparse => |s| s,
+                else => return InterpreterError.NotImplemented,
+            };
+
+            const result_sparse = einsum.sparseEinsum2(
+                self.allocator,
+                &sparse0,
+                indices0.items,
+                &sparse1,
+                indices1.items,
+                output_indices,
+            ) catch return InterpreterError.EinsumError;
+
+            return Value{ .tensor_val = Tensor{ .f64_sparse = result_sparse } };
+        } else if (is_sparse0 and !is_sparse1) {
+            // Sparse-dense einsum
+            const sparse0 = switch (t0) {
+                .f64_sparse => |s| s,
+                else => return InterpreterError.NotImplemented,
+            };
+            const dense1 = switch (t1) {
+                .f64_dense => |d| d,
+                else => return InterpreterError.NotImplemented,
+            };
+
+            const result_sparse = einsum.sparseDenseEinsum2(
+                self.allocator,
+                &sparse0,
+                indices0.items,
+                &dense1,
+                indices1.items,
+                output_indices,
+            ) catch return InterpreterError.EinsumError;
+
+            return Value{ .tensor_val = Tensor{ .f64_sparse = result_sparse } };
+        } else {
+            // Dense-dense einsum (or dense-sparse, converted to dense)
+            const dense0 = switch (t0) {
+                .f64_dense => |d| d,
+                .f64_sparse => |s| s.toDense(self.allocator) catch return InterpreterError.OutOfMemory,
+                else => return InterpreterError.NotImplemented,
+            };
+            const dense1 = switch (t1) {
+                .f64_dense => |d| d,
+                .f64_sparse => |s| s.toDense(self.allocator) catch return InterpreterError.OutOfMemory,
+                else => return InterpreterError.NotImplemented,
+            };
+
+            // Call einsum2 to perform the contraction
+            const result_dense = einsum.einsum2(
+                self.allocator,
+                &dense0,
+                indices0.items,
+                &dense1,
+                indices1.items,
+                output_indices,
+            ) catch return InterpreterError.EinsumError;
+
+            return Value{ .tensor_val = Tensor{ .f64_dense = result_dense } };
+        }
     }
 
     /// Run fixpoint iteration for recursive rules
@@ -759,6 +825,16 @@ pub const Interpreter = struct {
                 .f64_dense => |dense| {
                     for (dense.data) |val| {
                         // Hash the float bits
+                        const bits: u64 = @bitCast(val);
+                        checksum = checksum *% 31 +% bits;
+                    }
+                },
+                .f64_sparse => |sparse| {
+                    // Hash sparse tensor: include indices and values
+                    for (sparse.indices.items, sparse.values.items) |idx, val| {
+                        for (idx) |i| {
+                            checksum = checksum *% 31 +% i;
+                        }
                         const bits: u64 = @bitCast(val);
                         checksum = checksum *% 31 +% bits;
                     }
