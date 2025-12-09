@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const ast = @import("../frontend/ast.zig");
+const lexer = @import("../frontend/lexer.zig");
+const parser = @import("../frontend/parser.zig");
 const tensor = @import("tensor.zig");
 const einsum = @import("einsum.zig");
 
@@ -24,6 +26,9 @@ pub const InterpreterError = error{
     OutOfMemory,
     NotImplemented,
     EinsumError,
+    ImportError,
+    FileNotFound,
+    ParseError,
 };
 
 /// Extract the base name from an index (for matching contracted indices)
@@ -198,16 +203,73 @@ pub const Interpreter = struct {
 
                 try self.defineTensor(s.name, shape.items, s.is_boolean);
             },
-            .import_stmt => {
-                // TODO: implement imports
+            .import_stmt => |im| {
+                try self.executeImport(im.path, im.alias);
             },
-            .export_stmt => {
-                // TODO: implement exports
+            .export_stmt => |ex| {
+                // Mark tensor as exported (for now, just validate it exists)
+                if (!self.tensors.contains(ex.name)) {
+                    // Tensor doesn't exist yet - that's OK, it might be defined later
+                    // We could track exports for validation, but for now just pass
+                }
             },
             .comment => {
                 // Comments are no-ops
             },
         }
+    }
+
+    /// Execute an import statement
+    /// Loads and executes another .tl file, importing its tensors and domains
+    fn executeImport(self: *Interpreter, raw_path: []const u8, alias: ?[]const u8) InterpreterError!void {
+        _ = alias; // TODO: implement aliased imports (prefix tensor names)
+
+        // Strip quotes from path if present (string literals include quotes)
+        var path = raw_path;
+        if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
+            path = path[1 .. path.len - 1];
+        }
+
+        // Read the file - don't free because tokens reference this memory
+        const source = std.fs.cwd().readFileAlloc(self.allocator, path, 10 * 1024 * 1024) catch {
+            return InterpreterError.FileNotFound;
+        };
+        // NOTE: We intentionally don't free `source` - it's a controlled leak
+        // because tokens reference slices into this buffer, and the AST references tokens
+
+        // Use arena for AST - we also don't deinit this because
+        // the interpreter's domain/tensor maps reference AST strings
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        const ast_allocator = arena.allocator();
+
+        // Lex - use arena allocator
+        var lex = lexer.Lexer.init(ast_allocator, source);
+
+        const tokens = lex.scanTokens() catch {
+            arena.deinit();
+            self.allocator.free(source);
+            return InterpreterError.ParseError;
+        };
+
+        // Parse
+        var p = parser.Parser.init(ast_allocator, tokens);
+
+        const program = p.parse() catch {
+            arena.deinit();
+            self.allocator.free(source);
+            return InterpreterError.ParseError;
+        };
+
+        // Execute the imported program
+        // This will add domains, tensors, and execute any equations
+        self.execute(&program) catch {
+            arena.deinit();
+            self.allocator.free(source);
+            return InterpreterError.ImportError;
+        };
+
+        // Keep arena and source alive - strings are referenced by interpreter state
+        // This is a controlled memory leak for imports
     }
 
     /// Execute a tensor equation

@@ -576,8 +576,15 @@ pub const Parser = struct {
         }
         const path_tok = self.advance();
 
-        const alias: ?[]const u8 = null;
-        // TODO: handle 'as' for aliases
+        // Handle 'as' for aliases: import "file.tl" as foo
+        var alias: ?[]const u8 = null;
+        if (self.check(.kw_as)) {
+            _ = self.advance(); // consume 'as'
+            if (!self.check(.identifier)) {
+                return ParseError.ExpectedIdentifier;
+            }
+            alias = self.advance().lexeme;
+        }
 
         return ast.Statement{
             .import_stmt = .{

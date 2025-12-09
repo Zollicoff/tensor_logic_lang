@@ -67,6 +67,7 @@ pub const TokenType = enum {
     kw_domain, // domain declaration
     kw_import,
     kw_export,
+    kw_as,
     kw_if,
     kw_else,
     kw_for,
@@ -142,6 +143,7 @@ pub const TokenType = enum {
             .kw_domain => "domain",
             .kw_import => "import",
             .kw_export => "export",
+            .kw_as => "as",
             .kw_if => "if",
             .kw_else => "else",
             .kw_for => "for",
@@ -219,6 +221,7 @@ pub const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "domain", .kw_domain },
     .{ "import", .kw_import },
     .{ "export", .kw_export },
+    .{ "as", .kw_as },
     .{ "if", .kw_if },
     .{ "else", .kw_else },
     .{ "for", .kw_for },
