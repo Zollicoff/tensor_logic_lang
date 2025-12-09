@@ -41,9 +41,10 @@ pub fn main() !void {
             std.debug.print("Error: 'run' command requires a file path\n", .{});
             return;
         }
-        // Parse flags: -f/--fixpoint, -t/--trace
+        // Parse flags: -f/--fixpoint, -t/--trace, -O/--optimize
         var use_fixpoint = false;
         var use_trace = false;
+        var use_optimize = false;
         var file_path: ?[]const u8 = null;
 
         for (args[2..]) |arg| {
@@ -51,13 +52,15 @@ pub fn main() !void {
                 use_fixpoint = true;
             } else if (std.mem.eql(u8, arg, "--trace") or std.mem.eql(u8, arg, "-t")) {
                 use_trace = true;
+            } else if (std.mem.eql(u8, arg, "--optimize") or std.mem.eql(u8, arg, "-O")) {
+                use_optimize = true;
             } else if (file_path == null) {
                 file_path = arg;
             }
         }
 
         if (file_path) |path| {
-            try runFile(allocator, path, use_fixpoint, use_trace);
+            try runFile(allocator, path, use_fixpoint, use_trace, use_optimize);
         } else {
             std.debug.print("Error: 'run' command requires a file path\n", .{});
             return;
@@ -76,7 +79,7 @@ pub fn main() !void {
         try printVersion();
     } else {
         // Assume it's a file path
-        try runFile(allocator, command, false, false);
+        try runFile(allocator, command, false, false, false);
     }
 }
 
@@ -103,6 +106,7 @@ fn printUsage() !void {
         \\Options:
         \\  -f, --fixpoint       Run until convergence (for recursive rules like Ancestor)
         \\  -t, --trace          Enable trace mode (print execution details to stderr)
+        \\  -O, --optimize       Enable AST optimizations (constant folding)
         \\
         \\Examples:
         \\  tlc repl
@@ -693,8 +697,9 @@ fn checkFile(allocator: std.mem.Allocator, path: []const u8) !void {
     }
 }
 
-fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool, use_trace: bool) !void {
+fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool, use_trace: bool, use_optimize: bool) !void {
     const stdout = std.fs.File.stdout();
+    const optimize_mod = @import("frontend/optimize.zig");
 
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
@@ -720,7 +725,7 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool, u
     var p = parser.Parser.init(ast_allocator, tokens);
     defer p.deinit();
 
-    const program = p.parse() catch |err| {
+    var program = p.parse() catch |err| {
         if (p.getLastError()) |parse_err| {
             std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ path, parse_err.location.line, parse_err.location.column, parse_err.message });
         } else {
@@ -728,6 +733,20 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool, u
         }
         return;
     };
+
+    // Optimize AST if requested
+    if (use_optimize) {
+        var opt = optimize_mod.Optimizer.init(ast_allocator);
+        opt.optimize(&program) catch {
+            std.debug.print("Optimization error\n", .{});
+            return;
+        };
+        if (opt.constants_folded > 0) {
+            const msg = std.fmt.allocPrint(allocator, "Optimized: {d} constants folded\n", .{opt.constants_folded}) catch return;
+            defer allocator.free(msg);
+            stdout.writeAll(msg) catch return;
+        }
+    }
 
     // Execute
     var interp = interpreter.Interpreter.init(allocator);

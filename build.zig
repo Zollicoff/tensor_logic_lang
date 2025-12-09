@@ -79,4 +79,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_optimizer_tests = b.addRunArtifact(optimizer_tests);
     test_step.dependOn(&run_optimizer_tests.step);
+
+    // AST optimizer tests
+    const ast_opt_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/frontend/optimize.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_ast_opt_tests = b.addRunArtifact(ast_opt_tests);
+    test_step.dependOn(&run_ast_opt_tests.step);
 }
