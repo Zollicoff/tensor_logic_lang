@@ -272,10 +272,19 @@ pub const Statement = union(enum) {
 pub const Program = struct {
     statements: []Statement,
     allocator: std.mem.Allocator,
+    /// Optional arena that owns all AST memory - if set, deinit frees it
+    arena: ?*std.heap.ArenaAllocator = null,
 
     pub fn deinit(self: *Program) void {
-        // Free all allocated AST nodes
-        self.allocator.free(self.statements);
+        if (self.arena) |arena| {
+            // Arena owns everything - free it all at once
+            const backing = arena.child_allocator;
+            arena.deinit();
+            backing.destroy(arena);
+        } else {
+            // Just free the statements slice (caller manages AST memory)
+            self.allocator.free(self.statements);
+        }
     }
 };
 

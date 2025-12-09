@@ -697,14 +697,22 @@ pub const Parser = struct {
 
 const lexer = @import("lexer.zig");
 
-fn parseSource(allocator: std.mem.Allocator, source: []const u8) !ast.Program {
-    var lex = lexer.Lexer.init(allocator, source);
-    defer lex.deinit();
+fn parseSource(backing_allocator: std.mem.Allocator, source: []const u8) !ast.Program {
+    // Create arena to own all AST memory
+    const arena = try backing_allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(backing_allocator);
+    const allocator = arena.allocator();
+
+    // Copy source to arena (lexer needs stable memory)
+    const src_copy = try allocator.dupe(u8, source);
+
+    var lex = lexer.Lexer.init(allocator, src_copy);
     const toks = try lex.scanTokens();
 
-    var parser = Parser.init(allocator, toks);
-    defer parser.deinit();
-    return parser.parse();
+    var p = Parser.init(allocator, toks);
+    var program = try p.parse();
+    program.arena = arena; // Program now owns the arena
+    return program;
 }
 
 test "parse simple equation" {
