@@ -427,6 +427,80 @@ pub fn sparsityRatio(t: *const Tensor) f64 {
     return @as(f64, @floatFromInt(nnz)) / @as(f64, @floatFromInt(total));
 }
 
+/// Sparsity threshold: if density < this, use sparse storage
+/// 10% density = 90% sparse is the threshold
+pub const SPARSE_THRESHOLD: f64 = 0.1;
+
+/// Minimum size for automatic sparse conversion (small tensors stay dense)
+pub const MIN_SIZE_FOR_SPARSE: usize = 100;
+
+/// Check if a tensor should be converted to sparse storage
+pub fn shouldBeSparse(t: *const Tensor) bool {
+    const total = t.shape().numel();
+    if (total < MIN_SIZE_FOR_SPARSE) return false;
+
+    const density = sparsityRatio(t);
+    return density < SPARSE_THRESHOLD;
+}
+
+/// Check if a sparse tensor should be converted to dense storage
+pub fn shouldBeDense(t: *const Tensor) bool {
+    if (!t.isSparse()) return false;
+
+    const total = t.shape().numel();
+    const density = sparsityRatio(t);
+
+    // Convert to dense if density > 50% or tensor is small
+    return density > 0.5 or total < MIN_SIZE_FOR_SPARSE;
+}
+
+/// Convert tensor to sparse if beneficial, returns new tensor or null if no change
+pub fn maybeConvertToSparse(allocator: std.mem.Allocator, t: *Tensor) !?Tensor {
+    if (t.isSparse()) return null;
+    if (!shouldBeSparse(t)) return null;
+
+    switch (t.*) {
+        .f64_dense => |dense| {
+            const sparse = try SparseTensor(f64).fromDense(allocator, &dense);
+            return Tensor{ .f64_sparse = sparse };
+        },
+        else => return null,
+    }
+}
+
+/// Convert tensor to dense if beneficial, returns new tensor or null if no change
+pub fn maybeConvertToDense(allocator: std.mem.Allocator, t: *Tensor) !?Tensor {
+    if (!t.isSparse()) return null;
+    if (!shouldBeDense(t)) return null;
+
+    switch (t.*) {
+        .f64_sparse => |sparse| {
+            const dense = try sparse.toDense(allocator);
+            return Tensor{ .f64_dense = dense };
+        },
+        else => return null,
+    }
+}
+
+/// Optimize tensor storage based on current sparsity
+/// Returns true if the tensor was converted
+pub fn optimizeStorage(allocator: std.mem.Allocator, t: *Tensor) !bool {
+    if (t.isSparse()) {
+        if (try maybeConvertToDense(allocator, t)) |new_tensor| {
+            t.deinit();
+            t.* = new_tensor;
+            return true;
+        }
+    } else {
+        if (try maybeConvertToSparse(allocator, t)) |new_tensor| {
+            t.deinit();
+            t.* = new_tensor;
+            return true;
+        }
+    }
+    return false;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -554,4 +628,56 @@ test "sparse tensor iterator" {
 
     try std.testing.expectEqual(@as(usize, 2), count);
     try std.testing.expectEqual(@as(f64, 30.0), sum);
+}
+
+test "should be sparse detection" {
+    const allocator = std.testing.allocator;
+
+    // Small tensor - should NOT be sparse regardless of sparsity
+    var small = try zeros(allocator, &[_]usize{ 5, 5 });
+    defer small.deinit();
+    try std.testing.expectEqual(false, shouldBeSparse(&small));
+
+    // Large sparse tensor (all zeros) - should be sparse
+    var large_sparse = try zeros(allocator, &[_]usize{ 100, 100 });
+    defer large_sparse.deinit();
+    // Density is 0% (all zeros) < 10% threshold
+    try std.testing.expectEqual(true, shouldBeSparse(&large_sparse));
+
+    // Large dense tensor - should NOT be sparse
+    var large_dense = try ones(allocator, &[_]usize{ 100, 100 });
+    defer large_dense.deinit();
+    // Density is 100% > 10% threshold
+    try std.testing.expectEqual(false, shouldBeSparse(&large_dense));
+}
+
+test "automatic storage optimization" {
+    const allocator = std.testing.allocator;
+
+    // Create a large sparse tensor (all zeros)
+    var t = try zeros(allocator, &[_]usize{ 50, 50 });
+    defer t.deinit();
+
+    // Set only 5 elements (2% density)
+    switch (t) {
+        .f64_dense => |*d| {
+            d.set(&[_]usize{ 0, 0 }, 1.0);
+            d.set(&[_]usize{ 10, 10 }, 2.0);
+            d.set(&[_]usize{ 20, 20 }, 3.0);
+            d.set(&[_]usize{ 30, 30 }, 4.0);
+            d.set(&[_]usize{ 40, 40 }, 5.0);
+        },
+        else => {},
+    }
+
+    // Initially dense
+    try std.testing.expectEqual(false, t.isSparse());
+
+    // Optimize storage - should convert to sparse (5/2500 = 0.2% < 10%)
+    const converted = try optimizeStorage(allocator, &t);
+    try std.testing.expectEqual(true, converted);
+    try std.testing.expectEqual(true, t.isSparse());
+
+    // Verify values preserved
+    try std.testing.expectEqual(@as(usize, 5), countNonZero(&t));
 }

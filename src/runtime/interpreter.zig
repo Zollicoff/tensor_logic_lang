@@ -866,6 +866,9 @@ pub const Interpreter = struct {
             // Execute one iteration
             try self.execute(program);
 
+            // Optimize storage after each iteration
+            self.optimizeAllTensorStorage();
+
             // Check for convergence
             const new_checksum = self.computeStateChecksum();
             if (old_checksum == new_checksum) {
@@ -875,6 +878,14 @@ pub const Interpreter = struct {
         }
 
         return max_iters; // Did not converge within limit
+    }
+
+    /// Optimize storage for all tensors based on current sparsity
+    fn optimizeAllTensorStorage(self: *Interpreter) void {
+        var iter = self.tensors.iterator();
+        while (iter.next()) |entry| {
+            _ = tensor.optimizeStorage(self.allocator, entry.value_ptr) catch {};
+        }
     }
 
     /// Compute a checksum of all tensor values for convergence detection
