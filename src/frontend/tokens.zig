@@ -75,6 +75,8 @@ pub const TokenType = enum {
     kw_in,
     kw_true,
     kw_false,
+    kw_save,
+    kw_load,
 
     // Type keywords
     kw_real,
@@ -152,6 +154,8 @@ pub const TokenType = enum {
             .kw_in => "in",
             .kw_true => "true",
             .kw_false => "false",
+            .kw_save => "save",
+            .kw_load => "load",
             .kw_real => "real",
             .kw_int => "int",
             .kw_bool => "bool",
@@ -230,6 +234,8 @@ pub const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "in", .kw_in },
     .{ "true", .kw_true },
     .{ "false", .kw_false },
+    .{ "save", .kw_save },
+    .{ "load", .kw_load },
     .{ "real", .kw_real },
     .{ "int", .kw_int },
     .{ "bool", .kw_bool },

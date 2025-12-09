@@ -133,9 +133,75 @@ pub const Parser = struct {
         if (self.check(.kw_export)) {
             return self.parseExport();
         }
+        if (self.check(.kw_save)) {
+            return self.parseSave();
+        }
+        if (self.check(.kw_load)) {
+            return self.parseLoad();
+        }
 
         // Otherwise, it should be an equation
         return self.parseEquation();
+    }
+
+    fn parseSave(self: *Parser) ParseError!ast.Statement {
+        const location = self.peek().location;
+        _ = self.advance(); // consume 'save'
+
+        // Expect tensor name
+        if (!self.check(.identifier)) {
+            self.recordError("expected tensor name after 'save'");
+            return ParseError.ExpectedIdentifier;
+        }
+        const name = self.advance().lexeme;
+
+        // Expect string path
+        if (!self.check(.string)) {
+            self.recordError("expected file path string after tensor name");
+            return ParseError.UnexpectedToken;
+        }
+        const path = self.advance().lexeme;
+
+        // Consume newline
+        if (self.check(.newline)) _ = self.advance();
+
+        return ast.Statement{
+            .save_stmt = ast.Save{
+                .tensor_name = name,
+                .path = path,
+                .location = location,
+            },
+        };
+    }
+
+    fn parseLoad(self: *Parser) ParseError!ast.Statement {
+        const location = self.peek().location;
+        _ = self.advance(); // consume 'load'
+
+        // Expect tensor name
+        if (!self.check(.identifier)) {
+            self.recordError("expected tensor name after 'load'");
+            return ParseError.ExpectedIdentifier;
+        }
+        const name = self.advance().lexeme;
+
+        // Expect string path
+        if (!self.check(.string)) {
+            self.recordError("expected file path string after tensor name");
+            return ParseError.UnexpectedToken;
+        }
+        const path = self.advance().lexeme;
+
+        // Consume newline
+        if (self.check(.newline)) _ = self.advance();
+
+        return ast.Statement{
+            .load_stmt = ast.Load{
+                .tensor_name = name,
+                .path = path,
+                .location = location,
+            },
+        };
     }
 
     fn parseEquation(self: *Parser) ParseError!ast.Statement {

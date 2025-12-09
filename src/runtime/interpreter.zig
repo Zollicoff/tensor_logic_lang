@@ -246,10 +246,141 @@ pub const Interpreter = struct {
             .query => |q| {
                 try self.executeQuery(&q);
             },
+            .save_stmt => |s| {
+                try self.executeSave(&s);
+            },
+            .load_stmt => |l| {
+                try self.executeLoad(&l);
+            },
             .comment => {
                 // Comments are no-ops
             },
         }
+    }
+
+    /// Execute a save statement - write tensor to file
+    fn executeSave(self: *Interpreter, save: *const ast.Save) !void {
+        const name = save.tensor_name;
+        // Strip quotes from path
+        const path = if (save.path.len >= 2 and save.path[0] == '"')
+            save.path[1 .. save.path.len - 1]
+        else
+            save.path;
+
+        if (self.tensors.get(name)) |t| {
+            switch (t) {
+                .f64_dense => |dense| {
+                    // Build content string
+                    var content = std.ArrayListUnmanaged(u8){};
+                    defer content.deinit(self.allocator);
+
+                    // Write shape
+                    content.appendSlice(self.allocator, "shape:") catch return;
+                    for (dense.shape.dims, 0..) |dim, i| {
+                        if (i > 0) content.append(self.allocator, ',') catch return;
+                        var buf: [32]u8 = undefined;
+                        const str = std.fmt.bufPrint(&buf, "{d}", .{dim}) catch continue;
+                        content.appendSlice(self.allocator, str) catch return;
+                    }
+                    content.append(self.allocator, '\n') catch return;
+
+                    // Write data
+                    content.appendSlice(self.allocator, "data:") catch return;
+                    for (dense.data, 0..) |v, i| {
+                        if (i > 0) content.append(self.allocator, ',') catch return;
+                        var buf: [64]u8 = undefined;
+                        const str = std.fmt.bufPrint(&buf, "{d}", .{v}) catch continue;
+                        content.appendSlice(self.allocator, str) catch return;
+                    }
+                    content.append(self.allocator, '\n') catch return;
+
+                    // Write to file
+                    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+                        std.debug.print("Error creating file '{s}': {}\n", .{ path, err });
+                        return;
+                    };
+                    defer file.close();
+                    file.writeAll(content.items) catch return;
+                    std.debug.print("Saved {s} to {s}\n", .{ name, path });
+                },
+                else => {
+                    std.debug.print("Save not implemented for this tensor type\n", .{});
+                },
+            }
+        } else {
+            std.debug.print("Tensor {s} not found\n", .{name});
+        }
+    }
+
+    /// Execute a load statement - read tensor from file
+    fn executeLoad(self: *Interpreter, load: *const ast.Load) !void {
+        const name = load.tensor_name;
+        // Strip quotes from path
+        const path = if (load.path.len >= 2 and load.path[0] == '"')
+            load.path[1 .. load.path.len - 1]
+        else
+            load.path;
+
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            std.debug.print("Error opening file '{s}': {}\n", .{ path, err });
+            return;
+        };
+        defer file.close();
+
+        var buf: [65536]u8 = undefined;
+        const bytes_read = file.readAll(&buf) catch |err| {
+            std.debug.print("Error reading file: {}\n", .{err});
+            return;
+        };
+        const content = buf[0..bytes_read];
+
+        // Parse shape:dim1,dim2,...\ndata:v1,v2,...
+        var lines = std.mem.splitSequence(u8, content, "\n");
+
+        // Parse shape line
+        const shape_line = lines.next() orelse return;
+        if (!std.mem.startsWith(u8, shape_line, "shape:")) return;
+        const shape_str = shape_line[6..];
+
+        var shape = std.ArrayListUnmanaged(usize){};
+        defer shape.deinit(self.allocator);
+        var shape_parts = std.mem.splitSequence(u8, shape_str, ",");
+        while (shape_parts.next()) |part| {
+            const dim = std.fmt.parseInt(usize, part, 10) catch continue;
+            shape.append(self.allocator, dim) catch return;
+        }
+
+        // Parse data line
+        const data_line = lines.next() orelse return;
+        if (!std.mem.startsWith(u8, data_line, "data:")) return;
+        const data_str = data_line[5..];
+
+        var data = std.ArrayListUnmanaged(f64){};
+        defer data.deinit(self.allocator);
+        var data_parts = std.mem.splitSequence(u8, data_str, ",");
+        while (data_parts.next()) |part| {
+            const val = std.fmt.parseFloat(f64, part) catch continue;
+            data.append(self.allocator, val) catch return;
+        }
+
+        // Create tensor
+        var new_tensor = tensor.DenseTensor(f64).init(self.allocator, shape.items) catch return;
+        @memcpy(new_tensor.data[0..@min(new_tensor.data.len, data.items.len)], data.items[0..@min(new_tensor.data.len, data.items.len)]);
+
+        // Store tensor
+        if (self.tensors.getPtr(name)) |existing| {
+            existing.deinit();
+            existing.* = .{ .f64_dense = new_tensor };
+        } else {
+            self.tensors.put(name, .{ .f64_dense = new_tensor }) catch return;
+        }
+
+        std.debug.print("Loaded {s} from {s} (shape: ", .{ name, path });
+        for (shape.items, 0..) |dim, i| {
+            if (i > 0) std.debug.print(",", .{});
+            std.debug.print("{d}", .{dim});
+        }
+        std.debug.print(")\n", .{});
     }
 
     /// Execute a query statement - prints tensor value

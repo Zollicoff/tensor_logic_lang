@@ -262,6 +262,20 @@ pub const Query = struct {
     location: SourceLocation,
 };
 
+/// Save statement: save TensorName "filename"
+pub const Save = struct {
+    tensor_name: []const u8,
+    path: []const u8,
+    location: SourceLocation,
+};
+
+/// Load statement: load TensorName "filename"
+pub const Load = struct {
+    tensor_name: []const u8,
+    path: []const u8,
+    location: SourceLocation,
+};
+
 /// Top-level statement
 pub const Statement = union(enum) {
     equation: Equation,
@@ -270,6 +284,8 @@ pub const Statement = union(enum) {
     import_stmt: Import,
     export_stmt: Export,
     query: Query,
+    save_stmt: Save,
+    load_stmt: Load,
     comment: []const u8,
 };
 
