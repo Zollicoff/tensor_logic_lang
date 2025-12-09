@@ -145,6 +145,20 @@ pub fn DenseTensor(comptime T: type) type {
                 a.* *= scalar;
             }
         }
+
+        /// Clone the tensor (deep copy)
+        pub fn clone(self: *const Self, allocator: std.mem.Allocator) !Self {
+            const new_data = try allocator.alloc(T, self.data.len);
+            @memcpy(new_data, self.data);
+
+            const new_shape = try Shape.init(allocator, self.shape.dims);
+
+            return Self{
+                .data = new_data,
+                .shape = new_shape,
+                .allocator = allocator,
+            };
+        }
     };
 }
 

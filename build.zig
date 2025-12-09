@@ -57,4 +57,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_type_tests = b.addRunArtifact(type_tests);
     test_step.dependOn(&run_type_tests.step);
+
+    // Autodiff tests
+    const autodiff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime/autodiff.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_autodiff_tests = b.addRunArtifact(autodiff_tests);
+    test_step.dependOn(&run_autodiff_tests.step);
 }
