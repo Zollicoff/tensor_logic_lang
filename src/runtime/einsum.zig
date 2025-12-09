@@ -752,6 +752,257 @@ pub fn cosTensor(t: *DenseTensor(f64)) void {
 }
 
 // ============================================================================
+// Broadcasting Operations
+// ============================================================================
+
+/// Check if shapes are broadcast-compatible and compute result shape
+/// Returns null if shapes are incompatible
+pub fn broadcastShape(allocator: std.mem.Allocator, shape_a: []const usize, shape_b: []const usize) !?[]usize {
+    const max_rank = @max(shape_a.len, shape_b.len);
+    var result = try allocator.alloc(usize, max_rank);
+
+    // Align shapes from the right
+    var i: usize = 0;
+    while (i < max_rank) : (i += 1) {
+        const a_idx = if (i < shape_a.len) shape_a.len - 1 - i else null;
+        const b_idx = if (i < shape_b.len) shape_b.len - 1 - i else null;
+
+        const a_dim: usize = if (a_idx) |idx| shape_a[idx] else 1;
+        const b_dim: usize = if (b_idx) |idx| shape_b[idx] else 1;
+
+        if (a_dim == b_dim) {
+            result[max_rank - 1 - i] = a_dim;
+        } else if (a_dim == 1) {
+            result[max_rank - 1 - i] = b_dim;
+        } else if (b_dim == 1) {
+            result[max_rank - 1 - i] = a_dim;
+        } else {
+            // Incompatible shapes
+            allocator.free(result);
+            return null;
+        }
+    }
+
+    return result;
+}
+
+/// Broadcast add: C = A + B with broadcasting
+pub fn broadcastAdd(
+    allocator: std.mem.Allocator,
+    a: *const DenseTensor(f64),
+    b: *const DenseTensor(f64),
+) !DenseTensor(f64) {
+    const result_shape = try broadcastShape(allocator, a.shape.dims, b.shape.dims) orelse
+        return error.IncompatibleShapes;
+    defer allocator.free(result_shape);
+
+    var result = try DenseTensor(f64).init(allocator, result_shape);
+
+    // Iterate over all result indices
+    const total = result.data.len;
+    var flat_idx: usize = 0;
+    while (flat_idx < total) : (flat_idx += 1) {
+        // Convert flat index to multi-index
+        const result_idx = try allocator.alloc(usize, result_shape.len);
+        defer allocator.free(result_idx);
+        flatToMultiIndex(flat_idx, result_shape, result_idx);
+
+        // Map to A and B indices (with broadcasting)
+        const a_val = getBroadcastValue(a, result_idx, result_shape.len);
+        const b_val = getBroadcastValue(b, result_idx, result_shape.len);
+
+        result.data[flat_idx] = a_val + b_val;
+    }
+
+    return result;
+}
+
+/// Broadcast subtract: C = A - B with broadcasting
+pub fn broadcastSub(
+    allocator: std.mem.Allocator,
+    a: *const DenseTensor(f64),
+    b: *const DenseTensor(f64),
+) !DenseTensor(f64) {
+    const result_shape = try broadcastShape(allocator, a.shape.dims, b.shape.dims) orelse
+        return error.IncompatibleShapes;
+    defer allocator.free(result_shape);
+
+    var result = try DenseTensor(f64).init(allocator, result_shape);
+
+    const total = result.data.len;
+    var flat_idx: usize = 0;
+    while (flat_idx < total) : (flat_idx += 1) {
+        const result_idx = try allocator.alloc(usize, result_shape.len);
+        defer allocator.free(result_idx);
+        flatToMultiIndex(flat_idx, result_shape, result_idx);
+
+        const a_val = getBroadcastValue(a, result_idx, result_shape.len);
+        const b_val = getBroadcastValue(b, result_idx, result_shape.len);
+
+        result.data[flat_idx] = a_val - b_val;
+    }
+
+    return result;
+}
+
+/// Broadcast multiply (element-wise): C = A * B with broadcasting
+pub fn broadcastMul(
+    allocator: std.mem.Allocator,
+    a: *const DenseTensor(f64),
+    b: *const DenseTensor(f64),
+) !DenseTensor(f64) {
+    const result_shape = try broadcastShape(allocator, a.shape.dims, b.shape.dims) orelse
+        return error.IncompatibleShapes;
+    defer allocator.free(result_shape);
+
+    var result = try DenseTensor(f64).init(allocator, result_shape);
+
+    const total = result.data.len;
+    var flat_idx: usize = 0;
+    while (flat_idx < total) : (flat_idx += 1) {
+        const result_idx = try allocator.alloc(usize, result_shape.len);
+        defer allocator.free(result_idx);
+        flatToMultiIndex(flat_idx, result_shape, result_idx);
+
+        const a_val = getBroadcastValue(a, result_idx, result_shape.len);
+        const b_val = getBroadcastValue(b, result_idx, result_shape.len);
+
+        result.data[flat_idx] = a_val * b_val;
+    }
+
+    return result;
+}
+
+/// Broadcast divide: C = A / B with broadcasting
+pub fn broadcastDiv(
+    allocator: std.mem.Allocator,
+    a: *const DenseTensor(f64),
+    b: *const DenseTensor(f64),
+) !DenseTensor(f64) {
+    const result_shape = try broadcastShape(allocator, a.shape.dims, b.shape.dims) orelse
+        return error.IncompatibleShapes;
+    defer allocator.free(result_shape);
+
+    var result = try DenseTensor(f64).init(allocator, result_shape);
+
+    const total = result.data.len;
+    var flat_idx: usize = 0;
+    while (flat_idx < total) : (flat_idx += 1) {
+        const result_idx = try allocator.alloc(usize, result_shape.len);
+        defer allocator.free(result_idx);
+        flatToMultiIndex(flat_idx, result_shape, result_idx);
+
+        const a_val = getBroadcastValue(a, result_idx, result_shape.len);
+        const b_val = getBroadcastValue(b, result_idx, result_shape.len);
+
+        result.data[flat_idx] = if (b_val != 0) a_val / b_val else 0;
+    }
+
+    return result;
+}
+
+/// Convert flat index to multi-dimensional index
+fn flatToMultiIndex(flat_idx: usize, shape: []const usize, out_idx: []usize) void {
+    var remaining = flat_idx;
+    var i = shape.len;
+    while (i > 0) {
+        i -= 1;
+        out_idx[i] = remaining % shape[i];
+        remaining /= shape[i];
+    }
+}
+
+/// Get value from tensor with broadcasting
+/// result_idx is in the result coordinate space (potentially larger rank)
+fn getBroadcastValue(t: *const DenseTensor(f64), result_idx: []const usize, result_rank: usize) f64 {
+    const t_rank = t.shape.dims.len;
+    var t_idx: [8]usize = undefined; // Max 8 dimensions
+
+    // Map result indices to tensor indices (align from right)
+    var i: usize = 0;
+    while (i < t_rank) : (i += 1) {
+        const result_pos = result_rank - t_rank + i;
+        const t_dim = t.shape.dims[i];
+        // If dimension is 1, broadcast (use index 0)
+        // Otherwise, use the result index
+        t_idx[i] = if (t_dim == 1) 0 else result_idx[result_pos];
+    }
+
+    return t.get(t_idx[0..t_rank]);
+}
+
+/// Add scalar to tensor (broadcast scalar over all elements)
+pub fn addScalar(t: *DenseTensor(f64), scalar: f64) void {
+    for (t.data) |*x| {
+        x.* += scalar;
+    }
+}
+
+/// Multiply tensor by scalar
+pub fn mulScalar(t: *DenseTensor(f64), scalar: f64) void {
+    for (t.data) |*x| {
+        x.* *= scalar;
+    }
+}
+
+// ============================================================================
+// Element-wise Conditional (where)
+// ============================================================================
+
+/// Element-wise conditional: where(cond, then, else)
+/// Returns then[i] if cond[i] > 0, else returns else_val[i]
+/// Supports broadcasting between all three tensors
+pub fn where(
+    allocator: std.mem.Allocator,
+    cond: *const DenseTensor(f64),
+    then_val: *const DenseTensor(f64),
+    else_val: *const DenseTensor(f64),
+) !DenseTensor(f64) {
+    // Compute broadcast shape from all three tensors
+    const shape12 = try broadcastShape(allocator, cond.shape.dims, then_val.shape.dims) orelse
+        return error.IncompatibleShapes;
+    defer allocator.free(shape12);
+
+    const result_shape = try broadcastShape(allocator, shape12, else_val.shape.dims) orelse
+        return error.IncompatibleShapes;
+    defer allocator.free(result_shape);
+
+    var result = try DenseTensor(f64).init(allocator, result_shape);
+
+    const total = result.data.len;
+    var flat_idx: usize = 0;
+    while (flat_idx < total) : (flat_idx += 1) {
+        const result_idx = try allocator.alloc(usize, result_shape.len);
+        defer allocator.free(result_idx);
+        flatToMultiIndex(flat_idx, result_shape, result_idx);
+
+        const cond_val = getBroadcastValue(cond, result_idx, result_shape.len);
+        const t_val = getBroadcastValue(then_val, result_idx, result_shape.len);
+        const e_val = getBroadcastValue(else_val, result_idx, result_shape.len);
+
+        result.data[flat_idx] = if (cond_val > 0) t_val else e_val;
+    }
+
+    return result;
+}
+
+/// Element-wise conditional with scalar then/else values
+pub fn whereScalar(
+    allocator: std.mem.Allocator,
+    cond: *const DenseTensor(f64),
+    then_scalar: f64,
+    else_scalar: f64,
+) !DenseTensor(f64) {
+    var result = try DenseTensor(f64).init(allocator, cond.shape.dims);
+
+    for (cond.data, 0..) |c, i| {
+        result.data[i] = if (c > 0) then_scalar else else_scalar;
+    }
+
+    return result;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -962,4 +1213,116 @@ test "sparse step function" {
     try std.testing.expectEqual(@as(f64, 1.0), t.get(&[_]usize{ 0, 0 }));
     try std.testing.expectEqual(@as(f64, 0.0), t.get(&[_]usize{ 1, 1 }));
     try std.testing.expectEqual(@as(f64, 1.0), t.get(&[_]usize{ 2, 2 }));
+}
+
+test "broadcast shape computation" {
+    const allocator = std.testing.allocator;
+
+    // [3, 1] + [1, 4] -> [3, 4]
+    {
+        const a_shape = [_]usize{ 3, 1 };
+        const b_shape = [_]usize{ 1, 4 };
+        const result = (try broadcastShape(allocator, &a_shape, &b_shape)).?;
+        defer allocator.free(result);
+        try std.testing.expectEqual(@as(usize, 2), result.len);
+        try std.testing.expectEqual(@as(usize, 3), result[0]);
+        try std.testing.expectEqual(@as(usize, 4), result[1]);
+    }
+
+    // [5, 3, 1] + [3, 4] -> [5, 3, 4]
+    {
+        const a_shape = [_]usize{ 5, 3, 1 };
+        const b_shape = [_]usize{ 3, 4 };
+        const result = (try broadcastShape(allocator, &a_shape, &b_shape)).?;
+        defer allocator.free(result);
+        try std.testing.expectEqual(@as(usize, 3), result.len);
+        try std.testing.expectEqual(@as(usize, 5), result[0]);
+        try std.testing.expectEqual(@as(usize, 3), result[1]);
+        try std.testing.expectEqual(@as(usize, 4), result[2]);
+    }
+
+    // [4] + [3, 4] -> [3, 4]
+    {
+        const a_shape = [_]usize{4};
+        const b_shape = [_]usize{ 3, 4 };
+        const result = (try broadcastShape(allocator, &a_shape, &b_shape)).?;
+        defer allocator.free(result);
+        try std.testing.expectEqual(@as(usize, 2), result.len);
+        try std.testing.expectEqual(@as(usize, 3), result[0]);
+        try std.testing.expectEqual(@as(usize, 4), result[1]);
+    }
+
+    // [3, 4] + [5, 4] -> null (incompatible)
+    {
+        const a_shape = [_]usize{ 3, 4 };
+        const b_shape = [_]usize{ 5, 4 };
+        const result = try broadcastShape(allocator, &a_shape, &b_shape);
+        try std.testing.expect(result == null);
+    }
+}
+
+test "broadcast add" {
+    const allocator = std.testing.allocator;
+
+    // A[3, 1] + B[1, 4] -> C[3, 4]
+    var a = try DenseTensor(f64).init(allocator, &[_]usize{ 3, 1 });
+    defer a.deinit();
+    a.data[0] = 1.0; // [0, 0]
+    a.data[1] = 2.0; // [1, 0]
+    a.data[2] = 3.0; // [2, 0]
+
+    var b = try DenseTensor(f64).init(allocator, &[_]usize{ 1, 4 });
+    defer b.deinit();
+    b.data[0] = 10.0;
+    b.data[1] = 20.0;
+    b.data[2] = 30.0;
+    b.data[3] = 40.0;
+
+    var c = try broadcastAdd(allocator, &a, &b);
+    defer c.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), c.shape.dims.len);
+    try std.testing.expectEqual(@as(usize, 3), c.shape.dims[0]);
+    try std.testing.expectEqual(@as(usize, 4), c.shape.dims[1]);
+
+    // C[0, 0] = A[0, 0] + B[0, 0] = 1 + 10 = 11
+    try std.testing.expectEqual(@as(f64, 11.0), c.get(&[_]usize{ 0, 0 }));
+    // C[0, 1] = A[0, 0] + B[0, 1] = 1 + 20 = 21
+    try std.testing.expectEqual(@as(f64, 21.0), c.get(&[_]usize{ 0, 1 }));
+    // C[1, 2] = A[1, 0] + B[0, 2] = 2 + 30 = 32
+    try std.testing.expectEqual(@as(f64, 32.0), c.get(&[_]usize{ 1, 2 }));
+    // C[2, 3] = A[2, 0] + B[0, 3] = 3 + 40 = 43
+    try std.testing.expectEqual(@as(f64, 43.0), c.get(&[_]usize{ 2, 3 }));
+}
+
+test "broadcast 1d bias to 2d" {
+    // This is the key neural network use case: Z[batch, hidden] + b[hidden]
+    const allocator = std.testing.allocator;
+
+    // Z[4, 8] - batch of 4, hidden dim 8
+    var z = try DenseTensor(f64).init(allocator, &[_]usize{ 4, 8 });
+    defer z.deinit();
+    // Fill with 1.0
+    for (z.data) |*x| x.* = 1.0;
+
+    // b[8] - bias vector
+    var b = try DenseTensor(f64).init(allocator, &[_]usize{8});
+    defer b.deinit();
+    for (0..8) |i| b.data[i] = @floatFromInt(i);
+
+    // Z + b should broadcast b to [4, 8]
+    var result = try broadcastAdd(allocator, &z, &b);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.shape.dims.len);
+    try std.testing.expectEqual(@as(usize, 4), result.shape.dims[0]);
+    try std.testing.expectEqual(@as(usize, 8), result.shape.dims[1]);
+
+    // Each row should be [1, 2, 3, 4, 5, 6, 7, 8] (1.0 + 0..7)
+    try std.testing.expectEqual(@as(f64, 1.0), result.get(&[_]usize{ 0, 0 }));
+    try std.testing.expectEqual(@as(f64, 2.0), result.get(&[_]usize{ 0, 1 }));
+    try std.testing.expectEqual(@as(f64, 8.0), result.get(&[_]usize{ 0, 7 }));
+    // Same for other rows
+    try std.testing.expectEqual(@as(f64, 1.0), result.get(&[_]usize{ 3, 0 }));
+    try std.testing.expectEqual(@as(f64, 8.0), result.get(&[_]usize{ 3, 7 }));
 }

@@ -755,7 +755,7 @@ pub const Interpreter = struct {
                 var right = try self.evaluateExprWithIndices(bin.right, output_indices);
                 defer right.deinit();
 
-                // Handle scalar operations
+                // Handle scalar-scalar operations
                 if (left == .f64_val and right == .f64_val) {
                     const l = left.f64_val;
                     const r = right.f64_val;
@@ -768,6 +768,61 @@ pub const Interpreter = struct {
                         else => l,
                     };
                     return Value{ .f64_val = result };
+                }
+
+                // Handle tensor-tensor operations with broadcasting
+                if (left == .tensor_val and right == .tensor_val) {
+                    const left_dense = switch (left.tensor_val) {
+                        .f64_dense => |d| d,
+                        else => return InterpreterError.NotImplemented,
+                    };
+                    const right_dense = switch (right.tensor_val) {
+                        .f64_dense => |d| d,
+                        else => return InterpreterError.NotImplemented,
+                    };
+
+                    const result_dense = switch (bin.op) {
+                        .add => einsum.broadcastAdd(self.allocator, &left_dense, &right_dense) catch return InterpreterError.ShapeMismatch,
+                        .sub => einsum.broadcastSub(self.allocator, &left_dense, &right_dense) catch return InterpreterError.ShapeMismatch,
+                        .mul => einsum.broadcastMul(self.allocator, &left_dense, &right_dense) catch return InterpreterError.ShapeMismatch,
+                        .div => einsum.broadcastDiv(self.allocator, &left_dense, &right_dense) catch return InterpreterError.ShapeMismatch,
+                        else => return InterpreterError.NotImplemented,
+                    };
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result_dense } };
+                }
+
+                // Handle tensor-scalar operations
+                if (left == .tensor_val and right == .f64_val) {
+                    var result_tensor = switch (left.tensor_val) {
+                        .f64_dense => |d| d.clone(self.allocator) catch return InterpreterError.OutOfMemory,
+                        else => return InterpreterError.NotImplemented,
+                    };
+                    const scalar = right.f64_val;
+
+                    switch (bin.op) {
+                        .add => einsum.addScalar(&result_tensor, scalar),
+                        .sub => einsum.addScalar(&result_tensor, -scalar),
+                        .mul => einsum.mulScalar(&result_tensor, scalar),
+                        .div => einsum.mulScalar(&result_tensor, 1.0 / scalar),
+                        else => return InterpreterError.NotImplemented,
+                    }
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result_tensor } };
+                }
+
+                // Handle scalar-tensor operations
+                if (left == .f64_val and right == .tensor_val) {
+                    var result_tensor = switch (right.tensor_val) {
+                        .f64_dense => |d| d.clone(self.allocator) catch return InterpreterError.OutOfMemory,
+                        else => return InterpreterError.NotImplemented,
+                    };
+                    const scalar = left.f64_val;
+
+                    switch (bin.op) {
+                        .add => einsum.addScalar(&result_tensor, scalar),
+                        .mul => einsum.mulScalar(&result_tensor, scalar),
+                        else => return InterpreterError.NotImplemented,
+                    }
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result_tensor } };
                 }
 
                 return InterpreterError.NotImplemented;
@@ -796,8 +851,88 @@ pub const Interpreter = struct {
                 return self.evaluateExprWithIndices(inner, output_indices);
             },
 
-            .embed, .conditional => {
+            .embed => {
                 return InterpreterError.NotImplemented;
+            },
+
+            .conditional => |cond| {
+                // Evaluate condition
+                var condition_val = try self.evaluateExprWithIndices(cond.condition, output_indices);
+                defer condition_val.deinit();
+
+                // For tensor conditions, do element-wise conditional
+                if (condition_val == .tensor_val) {
+                    const cond_tensor = switch (condition_val.tensor_val) {
+                        .f64_dense => |d| d,
+                        else => return InterpreterError.NotImplemented,
+                    };
+
+                    var then_val = try self.evaluateExprWithIndices(cond.then_branch, output_indices);
+                    defer then_val.deinit();
+
+                    if (cond.else_branch) |else_expr| {
+                        var else_val = try self.evaluateExprWithIndices(else_expr, output_indices);
+                        defer else_val.deinit();
+
+                        // Handle different combinations
+                        if (then_val == .f64_val and else_val == .f64_val) {
+                            // Scalar then/else - use whereScalar
+                            const result = einsum.whereScalar(
+                                self.allocator,
+                                &cond_tensor,
+                                then_val.f64_val,
+                                else_val.f64_val,
+                            ) catch return InterpreterError.OutOfMemory;
+                            return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                        } else if (then_val == .tensor_val and else_val == .tensor_val) {
+                            // Tensor then/else - use where
+                            const then_tensor = switch (then_val.tensor_val) {
+                                .f64_dense => |d| d,
+                                else => return InterpreterError.NotImplemented,
+                            };
+                            const else_tensor = switch (else_val.tensor_val) {
+                                .f64_dense => |d| d,
+                                else => return InterpreterError.NotImplemented,
+                            };
+                            const result = einsum.where(
+                                self.allocator,
+                                &cond_tensor,
+                                &then_tensor,
+                                &else_tensor,
+                            ) catch return InterpreterError.ShapeMismatch;
+                            return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                        }
+                    } else {
+                        // No else branch - use 0.0 as default
+                        if (then_val == .f64_val) {
+                            const result = einsum.whereScalar(
+                                self.allocator,
+                                &cond_tensor,
+                                then_val.f64_val,
+                                0.0,
+                            ) catch return InterpreterError.OutOfMemory;
+                            return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                        }
+                    }
+                    return InterpreterError.NotImplemented;
+                }
+
+                // For scalar conditions, use simple branching
+                const is_true = switch (condition_val) {
+                    .bool_val => |b| b,
+                    .f64_val => |v| v > 0,
+                    .i64_val => |v| v > 0,
+                    else => false,
+                };
+
+                if (is_true) {
+                    return self.evaluateExprWithIndices(cond.then_branch, output_indices);
+                } else if (cond.else_branch) |else_expr| {
+                    return self.evaluateExprWithIndices(else_expr, output_indices);
+                } else {
+                    // No else branch, return 0
+                    return Value{ .f64_val = 0.0 };
+                }
             },
         }
     }

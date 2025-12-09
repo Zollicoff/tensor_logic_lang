@@ -68,4 +68,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_autodiff_tests = b.addRunArtifact(autodiff_tests);
     test_step.dependOn(&run_autodiff_tests.step);
+
+    // Optimizer tests
+    const optimizer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/runtime/optimizer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_optimizer_tests = b.addRunArtifact(optimizer_tests);
+    test_step.dependOn(&run_optimizer_tests.step);
 }

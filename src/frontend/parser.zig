@@ -425,6 +425,29 @@ pub const Parser = struct {
     }
 
     fn parsePrimary(self: *Parser) ParseError!*ast.Expr {
+        // Conditional: if cond then_expr else else_expr
+        if (self.match(.kw_if)) {
+            const condition = try self.parseExpr();
+
+            // 'then' is optional - can be if cond expr else expr
+            // For now, require expression after condition
+            const then_branch = try self.parseExpr();
+
+            var else_branch: ?*ast.Expr = null;
+            if (self.match(.kw_else)) {
+                else_branch = try self.parseExpr();
+            }
+
+            const cond_expr = self.builder.createExpr(.{
+                .conditional = .{
+                    .condition = condition,
+                    .then_branch = then_branch,
+                    .else_branch = else_branch,
+                },
+            }) catch return ParseError.OutOfMemory;
+            return cond_expr;
+        }
+
         // Nonlinearity function: step(x), relu(x), etc.
         if (self.matchNonlinearity()) |func| {
             if (!self.match(.lparen)) {
