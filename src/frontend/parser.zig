@@ -189,6 +189,9 @@ pub const Parser = struct {
         if (self.match(.plus_equals)) {
             return .add;
         }
+        if (self.match(.star_equals)) {
+            return .mul;
+        }
         if (self.match(.max_equals)) {
             return .max;
         }
@@ -198,7 +201,7 @@ pub const Parser = struct {
         if (self.match(.avg_equals)) {
             return .avg;
         }
-        self.recordError("expected '=', '+=', 'max=', 'min=', or 'avg='");
+        self.recordError("expected '=', '+=', '*=', 'max=', 'min=', or 'avg='");
         return ParseError.ExpectedEquals;
     }
 

@@ -143,6 +143,7 @@ pub const Nonlinearity = enum {
 pub const AccumulationOp = enum {
     assign, // = (overwrite)
     add, // += (sum)
+    mul, // *= (product)
     max, // max= (maximum)
     min, // min= (minimum)
     avg, // avg= (average)

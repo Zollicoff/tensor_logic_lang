@@ -45,6 +45,7 @@ pub const TokenType = enum {
 
     // Compound assignment (accumulation operators)
     plus_equals, // +=
+    star_equals, // *=
     max_equals, // max=
     min_equals, // min=
     avg_equals, // avg=
@@ -123,6 +124,7 @@ pub const TokenType = enum {
             .prime => "'",
             .semicolon => ";",
             .plus_equals => "+=",
+            .star_equals => "*=",
             .max_equals => "max=",
             .min_equals => "min=",
             .avg_equals => "avg=",

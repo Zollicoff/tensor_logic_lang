@@ -68,7 +68,13 @@ pub const Lexer = struct {
             ')' => try self.addToken(.rparen),
             '{' => try self.addToken(.lbrace),
             '}' => try self.addToken(.rbrace),
-            '*' => try self.addToken(.star),
+            '*' => {
+                if (self.match('=')) {
+                    try self.addToken(.star_equals);
+                } else {
+                    try self.addToken(.star);
+                }
+            },
             '^' => try self.addToken(.caret),
             '?' => try self.addToken(.question),
             '@' => try self.addToken(.at),

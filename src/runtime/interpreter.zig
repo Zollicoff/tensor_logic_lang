@@ -520,6 +520,36 @@ pub const Interpreter = struct {
                     else => {},
                 }
             },
+            .mul => {
+                // Multiply (element-wise product accumulation)
+                switch (lhs_tensor.*) {
+                    .f64_dense => |*t| {
+                        switch (rhs_val) {
+                            .tensor_val => |rv| {
+                                if (rv == .f64_dense) {
+                                    for (t.data, rv.f64_dense.data) |*a, b| {
+                                        a.* *= b;
+                                    }
+                                }
+                            },
+                            .f64_val => |v| {
+                                // Multiply all elements by scalar
+                                for (t.data) |*x| {
+                                    x.* *= v;
+                                }
+                            },
+                            .i64_val => |v| {
+                                const fv: f64 = @floatFromInt(v);
+                                for (t.data) |*x| {
+                                    x.* *= fv;
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
+            },
             .max => {
                 // Take element-wise max
                 switch (lhs_tensor.*) {
@@ -677,6 +707,10 @@ pub const Interpreter = struct {
                         const old = dense.get(indices);
                         dense.set(indices, old + scalar);
                     },
+                    .mul => {
+                        const old = dense.get(indices);
+                        dense.set(indices, old * scalar);
+                    },
                     .max => {
                         const old = dense.get(indices);
                         dense.set(indices, @max(old, scalar));
@@ -696,6 +730,10 @@ pub const Interpreter = struct {
                     .add => {
                         const old = sparse.get(indices);
                         sparse.set(indices, old + scalar) catch return InterpreterError.OutOfMemory;
+                    },
+                    .mul => {
+                        const old = sparse.get(indices);
+                        sparse.set(indices, old * scalar) catch return InterpreterError.OutOfMemory;
                     },
                     .max => {
                         const old = sparse.get(indices);
