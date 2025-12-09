@@ -15,6 +15,28 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // Create frontend module for reuse
+    const frontend_module = b.createModule(.{
+        .root_source_file = b.path("src/frontend/frontend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // LSP Server executable: tlc-lsp
+    const lsp_module = b.createModule(.{
+        .root_source_file = b.path("src/lsp/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "frontend", .module = frontend_module },
+        },
+    });
+    const lsp_exe = b.addExecutable(.{
+        .name = "tlc-lsp",
+        .root_module = lsp_module,
+    });
+    b.installArtifact(lsp_exe);
+
     // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
