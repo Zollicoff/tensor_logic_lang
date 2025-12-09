@@ -43,6 +43,12 @@ pub const Parser = struct {
     pub const ParserError = struct {
         message: []const u8,
         location: SourceLocation,
+
+        pub fn format(self: ParserError, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            _ = fmt;
+            _ = options;
+            try writer.print("Parse error at {d}:{d}: {s}", .{ self.location.line, self.location.column, self.message });
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, tokens_list: []const Token) Parser {
@@ -57,6 +63,34 @@ pub const Parser = struct {
 
     pub fn deinit(self: *Parser) void {
         self.errors.deinit(self.allocator);
+    }
+
+    /// Get the last recorded error (if any)
+    pub fn getLastError(self: *Parser) ?ParserError {
+        if (self.errors.items.len > 0) {
+            return self.errors.items[self.errors.items.len - 1];
+        }
+        return null;
+    }
+
+    /// Get all recorded errors
+    pub fn getErrors(self: *Parser) []const ParserError {
+        return self.errors.items;
+    }
+
+    /// Record an error with current token location
+    fn recordError(self: *Parser, message: []const u8) void {
+        const loc = if (self.current < self.tokens_list.len)
+            self.tokens_list[self.current].location
+        else if (self.tokens_list.len > 0)
+            self.tokens_list[self.tokens_list.len - 1].location
+        else
+            SourceLocation{ .line = 1, .column = 1, .offset = 0 };
+
+        self.errors.append(self.allocator, ParserError{
+            .message = message,
+            .location = loc,
+        }) catch {};
     }
 
     pub fn parse(self: *Parser) ParseError!ast.Program {
@@ -147,12 +181,14 @@ pub const Parser = struct {
         if (self.match(.avg_equals)) {
             return .avg;
         }
+        self.recordError("expected '=', '+=', 'max=', 'min=', or 'avg='");
         return ParseError.ExpectedEquals;
     }
 
     fn parseTensorRef(self: *Parser) ParseError!ast.TensorRef {
         const name_tok = self.advance();
         if (name_tok.type != .identifier) {
+            self.recordError("expected tensor name");
             return ParseError.ExpectedIdentifier;
         }
 
@@ -164,6 +200,7 @@ pub const Parser = struct {
             _ = self.advance();
             try self.parseIndices(&indices);
             if (!self.match(.rbracket)) {
+                self.recordError("expected ']' after indices");
                 return ParseError.ExpectedClosingBracket;
             }
         } else if (self.check(.lparen)) {
@@ -172,6 +209,7 @@ pub const Parser = struct {
             _ = self.advance();
             try self.parseIndices(&indices);
             if (!self.match(.rparen)) {
+                self.recordError("expected ')' after indices");
                 return ParseError.ExpectedClosingParen;
             }
         }
@@ -390,10 +428,12 @@ pub const Parser = struct {
         // Nonlinearity function: step(x), relu(x), etc.
         if (self.matchNonlinearity()) |func| {
             if (!self.match(.lparen)) {
+                self.recordError("expected '(' after function name");
                 return ParseError.ExpectedExpression;
             }
             const arg = try self.parseExpr();
             if (!self.match(.rparen)) {
+                self.recordError("expected ')' after function argument");
                 return ParseError.ExpectedClosingParen;
             }
             return self.builder.createNonlinearityExpr(func, arg) catch return ParseError.OutOfMemory;
@@ -407,6 +447,7 @@ pub const Parser = struct {
                 _ = self.advance(); // consume (
                 const expr = try self.parseExpr();
                 if (!self.match(.rparen)) {
+                    self.recordError("expected ')' to close grouped expression");
                     return ParseError.ExpectedClosingParen;
                 }
                 const grouped = self.builder.createExpr(.{ .group = expr }) catch return ParseError.OutOfMemory;
@@ -448,6 +489,7 @@ pub const Parser = struct {
             return self.builder.createLiteralExpr(.{ .string = tok.lexeme }) catch return ParseError.OutOfMemory;
         }
 
+        self.recordError("expected expression (tensor, number, or function call)");
         return ParseError.ExpectedExpression;
     }
 

@@ -209,7 +209,11 @@ fn runRepl(allocator: std.mem.Allocator) !void {
         var p = parser.Parser.init(ast_allocator, tokens);
 
         const program = p.parse() catch |err| {
-            printFmt(allocator, stdout, "Parse error: {}\n", .{err});
+            if (p.getLastError()) |parse_err| {
+                printFmt(allocator, stdout, "error at {d}:{d}: {s}\n", .{ parse_err.location.line, parse_err.location.column, parse_err.message });
+            } else {
+                printFmt(allocator, stdout, "Parse error: {}\n", .{err});
+            }
             continue;
         };
 
@@ -472,7 +476,11 @@ fn loadFile(interp: *interpreter.Interpreter, allocator: std.mem.Allocator, aren
     var p = parser.Parser.init(ast_allocator, tokens);
 
     const program = p.parse() catch |err| {
-        printFmt(allocator, file, "Parse error: {}\n", .{err});
+        if (p.getLastError()) |parse_err| {
+            printFmt(allocator, file, "error at {d}:{d}: {s}\n", .{ parse_err.location.line, parse_err.location.column, parse_err.message });
+        } else {
+            printFmt(allocator, file, "Parse error: {}\n", .{err});
+        }
         return;
     };
 
@@ -533,7 +541,11 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
     defer p.deinit();
 
     const program = p.parse() catch |err| {
-        std.debug.print("Parse error: {}\n", .{err});
+        if (p.getLastError()) |parse_err| {
+            std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ path, parse_err.location.line, parse_err.location.column, parse_err.message });
+        } else {
+            std.debug.print("Parse error: {}\n", .{err});
+        }
         return;
     };
 
@@ -614,7 +626,11 @@ fn runFile(allocator: std.mem.Allocator, path: []const u8, use_fixpoint: bool) !
     defer p.deinit();
 
     const program = p.parse() catch |err| {
-        std.debug.print("Parse error: {}\n", .{err});
+        if (p.getLastError()) |parse_err| {
+            std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ path, parse_err.location.line, parse_err.location.column, parse_err.message });
+        } else {
+            std.debug.print("Parse error: {}\n", .{err});
+        }
         return;
     };
 
