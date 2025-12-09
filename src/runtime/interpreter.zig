@@ -87,6 +87,8 @@ pub const Interpreter = struct {
     schemas: std.StringHashMap(TensorSchema),
     /// Default domain size (for undeclared domains)
     default_domain_size: usize,
+    /// Last executed program (for REPL fixpoint)
+    last_program: ?*const ast.Program,
 
     pub fn init(allocator: std.mem.Allocator) Interpreter {
         return Interpreter{
@@ -95,6 +97,7 @@ pub const Interpreter = struct {
             .domains = std.StringHashMap(usize).init(allocator),
             .schemas = std.StringHashMap(TensorSchema).init(allocator),
             .default_domain_size = 100, // Default domain size
+            .last_program = null,
         };
     }
 
@@ -164,6 +167,8 @@ pub const Interpreter = struct {
         for (program.statements) |stmt| {
             try self.executeStatement(&stmt);
         }
+        // Store for REPL fixpoint iteration
+        self.last_program = program;
     }
 
     /// Execute a single statement
