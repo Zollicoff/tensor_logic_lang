@@ -1,17 +1,18 @@
 # Tensor Logic Compiler (tlc)
 
-A compiler and runtime for Tensor Logic - a unified language for AI that combines neural networks, logic, and probabilistic inference through tensor operations.
+A compiled language for Tensor Logic - where everything is a tensor equation.
 
 Based on Pedro Domingos' paper "[Tensor Logic: The Language of AI](https://arxiv.org/abs/2307.01567)".
 
+> "The sole construct in tensor logic is the tensor equation"
+
 ## Overview
 
-Tensor Logic represents relations as tensors and uses Einstein summation notation for expressing computations. This enables:
+Tensor Logic unifies neural networks and logic programming through a single construct: the tensor equation. Relations are tensors, inference is matrix multiplication, and everything compiles to native code via LLVM.
 
-- **Neural Networks**: Express MLPs, attention, GNNs as tensor operations
-- **Logic Programming**: Relations as Boolean tensors, inference as matrix operations
-- **Probabilistic Reasoning**: Weighted model counting, belief propagation
-- **Automatic Differentiation**: Gradient-based learning on all operations
+```
+program.tl  →  tlc compile  →  LLVM IR  →  clang  →  native binary
+```
 
 ## Quick Start
 
@@ -19,82 +20,74 @@ Tensor Logic represents relations as tensors and uses Einstein summation notatio
 # Build the compiler
 zig build
 
-# Run a program
-./zig-out/bin/tlc run -f examples/matmul.tl
+# Compile a program
+./zig-out/bin/tlc compile examples/matmul.tl -o matmul.ll
 
-# Start the REPL
-./zig-out/bin/tlc repl
+# Build native binary
+clang matmul.ll -o matmul -lm
 
-# Run with fixpoint iteration (for recursive relations)
-./zig-out/bin/tlc run -f examples/ancestor.tl -p
+# Run
+./matmul
 ```
 
 ## Language Syntax
 
 ### Domain Declarations
 
-Define the size of tensor indices:
-
 ```
-domain i: 10    // Index i ranges from 0 to 9
-domain j: 5
+domain I(10)    # Index I ranges from 0 to 9
+domain J(5)
 ```
 
-### Tensor Initialization
+### Tensor Equations
+
+The only statement type:
 
 ```
-A[i,j] = 0      // Initialize 10x5 tensor to zeros
-B[i] = 1.5      // Initialize 10-element vector to 1.5
+LHS = [nonlinearity(] RHS [)]
 ```
 
 ### Einstein Summation
 
-Repeated indices are summed over (contracted):
+Repeated indices are contracted (summed):
 
 ```
-// Matrix multiplication: C[i,k] = sum_j(A[i,j] * B[j,k])
-C[i,k] = A[i,j] B[j,k]
+# Matrix multiplication: C[i,k] = sum_j(A[i,j] * B[j,k])
+C[I,K] = A[I,J] B[J,K]
 
-// Dot product: s = sum_i(a[i] * b[i])
-s = a[i] b[i]
+# Dot product: s = sum_i(a[i] * b[i])
+s = a[I] b[I]
 
-// Outer product: C[i,j] = a[i] * b[j]
-C[i,j] = a[i] b[j]
+# Outer product
+C[I,J] = a[I] b[J]
 ```
 
 ### Nonlinearities
 
 ```
-Y[i] = relu(X[i])
-Y[i] = sigmoid(X[i])
-Y[i] = softmax(X[i])
-Y[i] = tanh(X[i])
-Y[i] = exp(X[i])
-Y[i] = log(X[i])
-Y[i] = abs(X[i])
-Y[i] = sqrt(X[i])
+Y[I] = relu(X[I])
+Y[I] = sigmoid(X[I])
+Y[I,J.] = softmax(X[I,J])    # J. = normalization axis
+Y[I,J.] = lnorm(X[I,J])      # layer normalization
+Y[I] = tanh(X[I])
+Y[I] = step(X[I])            # Heaviside step (for Boolean logic)
+Y[I] = exp(X[I])
+Y[I] = log(X[I])
 ```
 
 ### Accumulation Operators
 
 ```
-A[i,k] += B[i,j] C[j,k]    // Sum accumulation
-A[i,k] max= B[i,j] C[j,k]  // Max accumulation
-A[i,k] min= B[i,j] C[j,k]  // Min accumulation
+A[I,K] += B[I,J] C[J,K]      # Sum accumulation (default)
+A[I,K] max= B[I,J] C[J,K]    # Max accumulation (for fixpoint)
+A[I,K] min= B[I,J] C[J,K]    # Min accumulation
+A[I,K] *= B[I,J] C[J,K]      # Product accumulation
 ```
 
-### Conditionals
+### Automatic Differentiation
 
 ```
-Y[i] = if X[i] > 0 then X[i] else 0  // Element-wise conditional
-```
-
-### Sparse Tensors
-
-```
-sparse Parent[i,j]         // Declare sparse relation
-Parent[0,1] = 1           // Set specific entries
-Parent[2,3] = 1
+backward L wrt W, X          # Compute gradients dL/dW, dL/dX
 ```
 
 ## Examples
@@ -102,82 +95,70 @@ Parent[2,3] = 1
 ### Matrix Multiplication
 
 ```
-domain i: 3
-domain j: 4
-domain k: 5
+domain I(3)
+domain J(4)
+domain K(5)
 
-A[i,j] = 0
-B[j,k] = 0
+tensor A[I,J] = [[1,2,3,4], [5,6,7,8], [9,10,11,12]]
+tensor B[J,K] = [[1,0,0,0,0], [0,1,0,0,0], [0,0,1,0,0], [0,0,0,1,0]]
 
-// Fill matrices...
-A[0,0] = 1
-B[0,0] = 2
-
-// Matrix multiply
-C[i,k] = A[i,j] B[j,k]
+C[I,K] = A[I,J] B[J,K]
 ```
 
-### Neural Network Layer
+### Neural Network with Training
 
 ```
-domain batch: 32
-domain in: 784
-domain hidden: 256
-domain out: 10
+domain B(32)
+domain I(784)
+domain H(256)
+domain O(10)
 
-// Forward pass
-H[batch,hidden] = relu(X[batch,in] W1[in,hidden] + B1[hidden])
-Y[batch,out] = softmax(H[batch,hidden] W2[hidden,out] + B2[out])
+# Forward pass
+Hidden[B,H] = relu(X[B,I] W1[I,H])
+Y[B,O] = softmax(Hidden[B,H] W2[H,O])
+
+# Loss
+L = (Y[B,O] - Target[B,O]) (Y[B,O] - Target[B,O])
+
+# Compute gradients
+backward L wrt W1, W2
 ```
 
-### Transitive Closure (Ancestor Relation)
+### Transitive Closure (Logic Programming)
 
 ```
-domain person: 5
+domain P(5)
 
-sparse Parent[i,j]
-Parent[0,1] = 1    // 0 is parent of 1
-Parent[1,2] = 1    // 1 is parent of 2
+# Parent relation (sparse)
+sparse Parent[P,P]
+Parent[0,1] = 1
+Parent[1,2] = 1
 
-// Ancestor = transitive closure of Parent
-Ancestor[i,j] = Parent[i,j]
-Ancestor[i,k] max= Ancestor[i,j] Parent[j,k]  // Fixpoint iteration
+# Ancestor = transitive closure
+Ancestor[I,J] = step(Parent[I,J])
+Ancestor[I,K] max= step(Ancestor[I,J] Parent[J,K])
 ```
 
 ### Self-Attention
 
 ```
-domain seq: 128
-domain dim: 64
+domain S(128)
+domain D(64)
 
-// Attention scores
-Attn[q,k] = softmax(Q[q,dim] K[k,dim] / sqrt(64))
-
-// Attended values
-Out[q,dim] = Attn[q,k] V[k,dim]
+Attn[Q,K.] = softmax(Query[Q,D] Key[K,D] / 8.0)
+Out[Q,D] = Attn[Q,K] Value[K,D]
 ```
 
-## CLI Options
+## CLI Reference
 
 ```
-tlc run -f <file>     Run a .tl file
-tlc run -f <file> -p  Run with fixpoint iteration
-tlc run -f <file> -t  Run with trace output
-tlc run -f <file> -O  Run with AST optimization
-tlc repl              Start interactive REPL
-tlc help              Show help
-```
-
-### REPL Commands
-
-```
-:help        Show help
-:show        Show all tensor values
-:show X      Show tensor X
-:clear       Clear all tensors
-:fixpoint    Run fixpoint iteration
-:load file   Load a .tl file
-:quit        Exit REPL
+tlc compile <file>           Compile to LLVM IR (stdout)
+tlc compile <file> -o out.ll Compile to file
+tlc check <file>             Type check only
+tlc lex <file>               Show tokens
+tlc parse <file>             Show AST
+tlc help                     Show help
+tlc version                  Show version
 ```
 
 ## Architecture
@@ -192,87 +173,44 @@ src/
 │   ├── tokens.zig        # Token types
 │   ├── types.zig         # Type checker
 │   └── optimize.zig      # AST optimizer
-└── runtime/
-    ├── interpreter.zig   # Evaluator
-    ├── tensor.zig        # Tensor storage
-    ├── einsum.zig        # Einstein summation
-    ├── autodiff.zig      # Automatic differentiation
-    ├── optimizer.zig     # SGD, Adam optimizers
-    ├── probability.zig   # Probabilistic inference
-    └── training.zig      # Training utilities
+├── codegen/
+│   ├── llvm.zig          # Main LLVM IR generator
+│   ├── autodiff.zig      # Automatic differentiation
+│   ├── einsum.zig        # Einstein summation loops
+│   ├── softmax.zig       # Softmax codegen
+│   ├── layernorm.zig     # Layer norm codegen
+│   ├── fixpoint.zig      # Recursive equation handling
+│   ├── tensor.zig        # Tensor allocation
+│   ├── expr.zig          # Expression codegen
+│   └── types.zig         # Shared types
+└── lsp/
+    └── server.zig        # VS Code language server
 ```
 
 ## Features
 
-### Implemented
-
-- [x] Lexer and parser for .tl files
-- [x] Dense and sparse tensor storage
-- [x] Einstein summation (einsum) operations
-- [x] Matrix operations (multiply, transpose, add)
-- [x] Nonlinearities (relu, sigmoid, softmax, tanh, exp, log)
-- [x] Accumulation operators (+=, max=, min=)
+- [x] Einstein summation (implicit contraction)
+- [x] All nonlinearities (relu, sigmoid, softmax, tanh, step, exp, log, lnorm)
+- [x] Accumulation operators (=, +=, max=, min=, *=)
 - [x] Fixpoint iteration for recursive relations
-- [x] REPL with command history
-- [x] Detailed error messages with source locations
+- [x] Reverse-mode automatic differentiation
 - [x] Type checking and shape inference
-- [x] Automatic differentiation (reverse-mode AD)
-- [x] Optimizers (SGD, Momentum, Adam)
-- [x] Broadcasting for tensor operations
-- [x] Conditionals (if-then-else)
-- [x] AST optimization (constant folding, strength reduction)
-- [x] Probabilistic inference (WMC, belief propagation)
-- [x] Training utilities
-
-### Examples Included
-
-- `matmul.tl` - Matrix multiplication
-- `ancestor.tl` - Transitive closure
-- `mlp.tl` - Multi-layer perceptron
-- `attention.tl` - Self-attention mechanism
-- `transformer.tl` - Transformer block
-- `gnn.tl` - Graph neural network
-- `neural_net.tl` - Complete neural network example
-- `broadcasting.tl` - Broadcasting and conditionals
-- `training.tl` - Gradient-based training
+- [x] LLVM IR code generation
+- [x] VS Code extension with LSP
 
 ## Building
 
 Requires Zig 0.15.0 or later.
 
 ```bash
-# Build
-zig build
-
-# Run tests
-zig build test
-
-# Build release
-zig build -Doptimize=ReleaseFast
-```
-
-## Testing
-
-```bash
-# Run all tests
-zig build test
-
-# The test suite covers:
-# - Lexer/parser
-# - Type checking
-# - Tensor operations
-# - Einsum contractions
-# - Autodiff gradients
-# - Optimizers
-# - Probabilistic inference
+zig build                        # Debug build
+zig build -Doptimize=ReleaseFast # Release build
+zig build test                   # Run tests
 ```
 
 ## References
 
 - Domingos, P. (2023). [Tensor Logic: The Language of AI](https://arxiv.org/abs/2307.01567)
-- Einstein summation notation
-- Automatic differentiation (reverse-mode/backpropagation)
-- Belief propagation and factor graphs
 
 ## License
 

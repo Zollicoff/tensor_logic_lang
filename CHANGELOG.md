@@ -1,5 +1,49 @@
 # Changelog
 
+## 2025-12-10 - Interpreter Removal (Back to Core Vision)
+
+**Removed: Interpreter, REPL, and all runtime modules**
+
+The original paper states: "The sole construct in tensor logic is the tensor equation."
+
+We had accumulated features that don't belong in the core language:
+- Interpreter (`src/runtime/interpreter.zig`)
+- REPL mode
+- Built-in optimizers (SGD, Adam)
+- Training utilities
+- Probability inference modules
+
+These have been **deleted**. The language is now purely compiled:
+- `tlc compile` is the primary (and only execution) command
+- No `run` or `repl` commands
+- Optimizers, training loops, etc. are expressible AS tensor equations
+
+**Files removed:**
+- `src/runtime/` directory (6,468 lines)
+  - interpreter.zig
+  - tensor.zig
+  - einsum.zig
+  - autodiff.zig
+  - optimizer.zig
+  - probability.zig
+  - training.zig
+
+**Codebase now:**
+```
+src/main.zig        ~400 lines (CLI)
+src/frontend/       ~3,700 lines (lexer, parser, types)
+src/codegen/        ~3,300 lines (LLVM IR generation)
+src/lsp/            ~700 lines (VS Code integration)
+Total:              ~8,100 lines (down from ~14,500)
+```
+
+**Updated documentation:**
+- README.md - Removed interpreter/REPL references
+- ARCHITECTURE.md - Clarified compiled-only philosophy
+- build.zig - Removed runtime test targets
+
+---
+
 ## Current State (2025-12-09)
 
 **LLVM Codegen is COMPLETE and MODULAR with AUTODIFF**
