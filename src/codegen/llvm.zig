@@ -642,6 +642,9 @@ pub const LLVMCodegen = struct {
         // For C[i,k] = A[i,j] B[j,k]:
         // dL/dA[i,j] = sum_k (dL/dC[i,k] * B[j,k])
         // This is essentially: dL/dA = dL/dC @ B^T
+        //
+        // Special case: dot product Y = A[i] B[i] (scalar result)
+        // dL/dA[i] = dL/dY * B[i] (scalar broadcast)
 
         const output_info = self.tensors.get(grad_eq.output) orelse return;
         const upstream_info = self.tensors.get(grad_eq.grad_upstream) orelse return;
@@ -650,6 +653,16 @@ pub const LLVMCodegen = struct {
         if (grad_eq.operands.len < 3) return;
         const b_name = grad_eq.operands[1];
         const b_info = self.tensors.get(b_name) orelse return;
+
+        // Check for dot product case: upstream is scalar, output is 1D
+        const upstream_is_scalar = upstream_info.totalSize() == 1;
+        const output_is_1d = output_info.dims.len == 1;
+
+        if (upstream_is_scalar and output_is_1d) {
+            // Dot product gradient: dL/dA[i] = dL/dY * B[i]
+            try self.genGradDotProductLeft(grad_eq, output_info, upstream_info, b_info);
+            return;
+        }
 
         // Get dimensions: A[i,j], B[j,k], C[i,k]
         // dL/dA[i,j] = sum_k dL/dC[i,k] * B[j,k]
@@ -772,6 +785,9 @@ pub const LLVMCodegen = struct {
         // For C[i,k] = A[i,j] B[j,k]:
         // dL/dB[j,k] = sum_i (A[i,j] * dL/dC[i,k])
         // This is essentially: dL/dB = A^T @ dL/dC
+        //
+        // Special case: dot product Y = A[i] B[i] (scalar result)
+        // dL/dB[i] = dL/dY * A[i] (scalar broadcast)
 
         const output_info = self.tensors.get(grad_eq.output) orelse return;
         const upstream_info = self.tensors.get(grad_eq.grad_upstream) orelse return;
@@ -780,6 +796,16 @@ pub const LLVMCodegen = struct {
         if (grad_eq.operands.len < 3) return;
         const a_name = grad_eq.operands[0];
         const a_info = self.tensors.get(a_name) orelse return;
+
+        // Check for dot product case: upstream is scalar, output is 1D
+        const upstream_is_scalar = upstream_info.totalSize() == 1;
+        const output_is_1d = output_info.dims.len == 1;
+
+        if (upstream_is_scalar and output_is_1d) {
+            // Dot product gradient: dL/dB[i] = dL/dY * A[i]
+            try self.genGradDotProductRight(grad_eq, output_info, upstream_info, a_info);
+            return;
+        }
 
         // Get dimensions: A[i,j], B[j,k], C[i,k]
         // dL/dB[j,k] = sum_i A[i,j] * dL/dC[i,k]
@@ -896,6 +922,92 @@ pub const LLVMCodegen = struct {
         try self.emitFmt("    store i64 {s}, ptr {s}\n", .{ j_next, j_var });
         try self.emitFmt("    br label %{s}\n", .{j_start});
         try self.emitFmt("{s}:\n", .{j_end});
+    }
+
+    fn genGradDotProductLeft(
+        self: *LLVMCodegen,
+        grad_eq: *const autodiff.GradEquation,
+        output_info: TensorInfo,
+        upstream_info: TensorInfo,
+        b_info: TensorInfo,
+    ) !void {
+        // For dot product Y = A[i] B[i]:
+        // dL/dA[i] = dL/dY * B[i]
+        // dL/dY is a scalar, broadcast it to all elements
+
+        _ = grad_eq;
+
+        // Load the scalar upstream gradient dL/dY
+        const dy_ptr = try self.newTemp();
+        try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 0\n", .{ dy_ptr, upstream_info.llvm_ptr });
+        const dy_val = try self.newTemp();
+        try self.emitFmt("    {s} = load double, ptr {s}\n", .{ dy_val, dy_ptr });
+
+        // Loop over all elements of B (and A)
+        const dim = output_info.dims[0];
+        for (0..dim) |i| {
+            // Load B[i]
+            const b_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ b_ptr, b_info.llvm_ptr, i });
+            const b_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ b_val, b_ptr });
+
+            // Compute dL/dY * B[i]
+            const grad = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, dy_val, b_val });
+
+            // Accumulate to dL/dA[i]
+            const out_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+            const old_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+            const new_val = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+        }
+    }
+
+    fn genGradDotProductRight(
+        self: *LLVMCodegen,
+        grad_eq: *const autodiff.GradEquation,
+        output_info: TensorInfo,
+        upstream_info: TensorInfo,
+        a_info: TensorInfo,
+    ) !void {
+        // For dot product Y = A[i] B[i]:
+        // dL/dB[i] = dL/dY * A[i]
+        // dL/dY is a scalar, broadcast it to all elements
+
+        _ = grad_eq;
+
+        // Load the scalar upstream gradient dL/dY
+        const dy_ptr = try self.newTemp();
+        try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 0\n", .{ dy_ptr, upstream_info.llvm_ptr });
+        const dy_val = try self.newTemp();
+        try self.emitFmt("    {s} = load double, ptr {s}\n", .{ dy_val, dy_ptr });
+
+        // Loop over all elements of A (and B)
+        const dim = output_info.dims[0];
+        for (0..dim) |i| {
+            // Load A[i]
+            const a_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ a_ptr, a_info.llvm_ptr, i });
+            const a_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ a_val, a_ptr });
+
+            // Compute dL/dY * A[i]
+            const grad = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, dy_val, a_val });
+
+            // Accumulate to dL/dB[i]
+            const out_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+            const old_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+            const new_val = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+        }
     }
 };
 

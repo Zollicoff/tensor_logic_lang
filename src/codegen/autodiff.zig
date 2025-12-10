@@ -387,9 +387,11 @@ pub const GradEquation = struct {
 /// Gradient computation rules
 pub const GradRule = enum {
     pass_through, // dL/dX = dL/dY (for identity/addition)
-    matmul_left, // dL/dA = dL/dC * B^T
-    matmul_right, // dL/dB = A^T * dL/dC
+    matmul_left, // dL/dA = dL/dC * B^T (2D matmul)
+    matmul_right, // dL/dB = A^T * dL/dC (2D matmul)
     matmul_self, // dL/dY from L = Y*Y -> 2*Y
+    dot_product_left, // dL/dA[i] = dL/dY * B[i] (1D dot product)
+    dot_product_right, // dL/dB[i] = dL/dY * A[i] (1D dot product)
     relu_grad, // dL/dX = dL/dY * step(X)
     sigmoid_grad, // dL/dX = dL/dY * Y * (1-Y)
     softmax_grad, // Complex Jacobian
