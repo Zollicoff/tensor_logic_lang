@@ -71,7 +71,7 @@ src/
 │   ├── llvm.zig          # Main orchestrator
 │   ├── autodiff.zig      # Computation graph, gradient derivation
 │   ├── einsum.zig        # Einstein summation (forward: loops)
-│   ├── backward.zig      # Backward chaining (planned: recursive fns)
+│   ├── backward.zig      # Backward chaining (recursive fns + memoization)
 │   ├── softmax.zig       # Softmax with reduction
 │   ├── layernorm.zig     # Layer normalization
 │   ├── concat.zig        # Concatenation for attention heads
@@ -95,12 +95,12 @@ src/
 - Division indices `X/2` for pooling
 - Concat for attention head merging
 - Forward chaining with fixpoint iteration
+- **Backward chaining with memoization** (recursive functions for query-driven inference)
 - Partial autodiff (2D matmul, relu, sigmoid gradients)
 - Virtual indices `*t`, primed indices `p'`, index arithmetic `i+1`
 - VS Code extension with LSP
 
 ### In Progress 🔧
-- **Backward chaining**: Compile to recursive functions for query-driven inference
 - **Full autodiff**: Complete gradient rules for all operations
 - **Sparse codegen**: Integrate existing sparse.zig (currently falls back to dense)
 - **Slice indices**: `X[4:8]` - parser done, codegen needed
@@ -118,7 +118,7 @@ src/
 | Tensor equations | ✅ | Core syntax |
 | Einstein summation | ✅ | einsum.zig |
 | Forward chaining | ✅ | loops + fixpoint |
-| Backward chaining | 🔧 | recursive functions |
+| Backward chaining | ✅ | recursive functions + memoization |
 | Autodiff | 🔧 | autodiff.zig (partial) |
 | Sparse tensors | 🔧 | sparse.zig (not integrated) |
 | Temperature σ(x,T) | 📋 | For embedding reasoning |

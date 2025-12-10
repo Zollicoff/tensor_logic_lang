@@ -23,6 +23,7 @@ const layernorm = @import("layernorm.zig");
 const fixpoint = @import("fixpoint.zig");
 const autodiff = @import("autodiff.zig");
 const concat = @import("concat.zig");
+const backward = @import("backward.zig");
 
 // Re-export types
 pub const TensorInfo = types.TensorInfo;
@@ -48,6 +49,9 @@ pub const LLVMCodegen = struct {
     // Pre-computed max dimensions for tensors (from scanning all constant indices)
     tensor_max_dims: std.StringHashMapUnmanaged([]usize),
 
+    // Track tensors that use backward chaining (for recursive calls)
+    backward_tensors: std.StringHashMapUnmanaged(void),
+
     pub fn init(allocator: std.mem.Allocator) LLVMCodegen {
         return .{
             .allocator = allocator,
@@ -59,6 +63,7 @@ pub const LLVMCodegen = struct {
             .tensors = .{},
             .domains = .{},
             .tensor_max_dims = .{},
+            .backward_tensors = .{},
         };
     }
 
@@ -77,6 +82,7 @@ pub const LLVMCodegen = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.tensor_max_dims.deinit(self.allocator);
+        self.backward_tensors.deinit(self.allocator);
     }
 
     // =========================================================================
@@ -155,6 +161,7 @@ pub const LLVMCodegen = struct {
             \\@.str.val = private constant [6 x i8] c"%.4g \00"
             \\@.str.end = private constant [3 x i8] c"]\0A\00"
             \\@.str.newline = private constant [2 x i8] c"\0A\00"
+            \\@.str.backward_result = private constant [11 x i8] c"%s = %.6g\0A\00"
             \\
         );
 
@@ -193,6 +200,50 @@ pub const LLVMCodegen = struct {
         }
 
         try self.emit("\n");
+
+        // Identify backward queries and track which tensors need backward functions
+        for (program.statements) |stmt| {
+            if (stmt == .query) {
+                if (backward.isBackwardQuery(&stmt.query)) {
+                    try self.backward_tensors.put(self.allocator, stmt.query.tensor.name, {});
+                }
+            }
+        }
+
+        // Pre-allocate tensors needed for backward chaining (so compute functions can reference them)
+        // This includes both the queried tensor and all tensors referenced in its equations
+        var backward_deps = std.StringHashMap(void).init(self.allocator);
+        defer backward_deps.deinit();
+
+        for (program.statements) |stmt| {
+            if (stmt == .equation) {
+                const eq = stmt.equation;
+                if (self.backward_tensors.contains(eq.lhs.name)) {
+                    // Allocate the target tensor
+                    if (!self.tensors.contains(eq.lhs.name)) {
+                        try tensor_mod.allocateTensorGlobal(self, eq.lhs.name, eq.lhs.indices);
+                    }
+                    // Collect tensor dependencies from RHS
+                    try collectTensorDeps(eq.rhs, &backward_deps);
+                }
+            }
+        }
+
+        // Allocate all dependency tensors as globals
+        for (program.statements) |stmt| {
+            if (stmt == .equation) {
+                const eq = stmt.equation;
+                if (backward_deps.contains(eq.lhs.name) and !self.backward_tensors.contains(eq.lhs.name)) {
+                    if (!self.tensors.contains(eq.lhs.name)) {
+                        try tensor_mod.allocateTensorGlobal(self, eq.lhs.name, eq.lhs.indices);
+                    }
+                }
+            }
+        }
+
+        // Generate backward chaining infrastructure (memo tables + compute functions)
+        // This must come before main() since compute functions are global
+        try backward.genBackwardInfra(self, program);
 
         // Main function
         try self.emit(
@@ -237,16 +288,24 @@ pub const LLVMCodegen = struct {
         }
 
         // Generate queries last (after fixpoint converges)
+        // Separate forward and backward queries
         for (program.statements) |stmt| {
             if (stmt == .query) {
-                try self.genStatement(&stmt, program);
+                if (backward.isBackwardQuery(&stmt.query)) {
+                    try backward.genBackwardQuery(self, &stmt.query);
+                } else {
+                    try self.genQuery(&stmt.query);
+                }
             }
         }
 
-        // Free tensors
+        // Free tensors (skip global tensors which start with @)
         var iter = self.tensors.iterator();
         while (iter.next()) |entry| {
-            try self.emitFmt("    call void @free(ptr {s})\n", .{entry.value_ptr.llvm_ptr});
+            // Global tensors start with '@', heap tensors start with '%'
+            if (entry.value_ptr.llvm_ptr.len > 0 and entry.value_ptr.llvm_ptr[0] == '%') {
+                try self.emitFmt("    call void @free(ptr {s})\n", .{entry.value_ptr.llvm_ptr});
+            }
         }
 
         try self.emit(
@@ -412,19 +471,19 @@ pub const LLVMCodegen = struct {
         try tensor_mod.allocateTensor(self, decl.name, indices.items);
     }
 
-    fn genBackward(self: *LLVMCodegen, backward: *const ast.Backward, program: *const ast.Program) !void {
-        try self.emitFmt("\n    ; Backward pass: {s} wrt {d} params\n", .{ backward.loss, backward.params.len });
+    fn genBackward(self: *LLVMCodegen, back_stmt: *const ast.Backward, program: *const ast.Program) !void {
+        try self.emitFmt("\n    ; Backward pass: {s} wrt {d} params\n", .{ back_stmt.loss, back_stmt.params.len });
 
         // Build computation graph and derive gradients
         var ad = autodiff.Autodiff.init(self.allocator);
         defer ad.deinit();
 
         try ad.buildGraph(program);
-        try ad.computeGradients(backward.loss, backward.params);
+        try ad.computeGradients(back_stmt.loss, back_stmt.params);
 
         // Generate gradient initialization (zeros)
         // First, allocate gradient tensors
-        for (backward.params) |param| {
+        for (back_stmt.params) |param| {
             const grad_name = try std.fmt.allocPrint(self.string_arena.allocator(), "dL_d{s}", .{param});
 
             // Get the original tensor info to determine shape
@@ -449,8 +508,8 @@ pub const LLVMCodegen = struct {
         }
 
         // Initialize dL/dLoss = 1 (gradient of loss w.r.t. itself)
-        const loss_grad = try std.fmt.allocPrint(self.string_arena.allocator(), "dL_d{s}", .{backward.loss});
-        if (self.tensors.get(backward.loss)) |loss_info| {
+        const loss_grad = try std.fmt.allocPrint(self.string_arena.allocator(), "dL_d{s}", .{back_stmt.loss});
+        if (self.tensors.get(back_stmt.loss)) |loss_info| {
             // Allocate loss gradient (scalar, so size 1)
             try self.emitFmt("    ; Initialize {s} = 1\n", .{loss_grad});
             const ptr = try self.newTemp();
@@ -1033,6 +1092,28 @@ pub const LLVMCodegen = struct {
         }
     }
 };
+
+/// Collect tensor names referenced in an expression
+fn collectTensorDeps(expression: *const ast.Expr, deps: *std.StringHashMap(void)) !void {
+    switch (expression.*) {
+        .tensor_ref => |ref| {
+            try deps.put(ref.name, {});
+        },
+        .product => |prod| {
+            for (prod.factors) |factor| {
+                try collectTensorDeps(factor, deps);
+            }
+        },
+        .binary => |bin| {
+            try collectTensorDeps(bin.left, deps);
+            try collectTensorDeps(bin.right, deps);
+        },
+        .nonlinearity => |nl| try collectTensorDeps(nl.arg, deps),
+        .unary => |un| try collectTensorDeps(un.operand, deps),
+        .group => |g| try collectTensorDeps(g, deps),
+        else => {},
+    }
+}
 
 /// Compile a program to LLVM IR
 pub fn compile(allocator: std.mem.Allocator, program: *const ast.Program) ![]const u8 {
