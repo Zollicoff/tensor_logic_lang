@@ -278,6 +278,14 @@ pub const Load = struct {
     location: SourceLocation,
 };
 
+/// Backward statement: backward L wrt W, X
+/// Derives gradient equations for loss L with respect to parameters
+pub const Backward = struct {
+    loss: []const u8, // Name of the loss tensor
+    params: []const []const u8, // Parameters to differentiate with respect to
+    location: SourceLocation,
+};
+
 /// Top-level statement
 pub const Statement = union(enum) {
     equation: Equation,
@@ -288,6 +296,7 @@ pub const Statement = union(enum) {
     query: Query,
     save_stmt: Save,
     load_stmt: Load,
+    backward_stmt: Backward,
     comment: []const u8,
 };
 

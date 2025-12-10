@@ -10,3 +10,5 @@ pub const optimize = @import("optimize.zig");
 pub const Lexer = lexer.Lexer;
 pub const Parser = parser.Parser;
 pub const SourceLocation = tokens.SourceLocation;
+pub const Token = tokens.Token;
+pub const TokenType = tokens.TokenType;

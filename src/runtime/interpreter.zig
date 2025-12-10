@@ -117,6 +117,10 @@ pub const Interpreter = struct {
     last_program: ?*const ast.Program,
     /// Trace mode: print execution details
     trace_enabled: bool,
+    /// Counts for avg= accumulation (tensor name -> count per element)
+    avg_counts: std.StringHashMap(DenseTensor(f64)),
+    /// Exported tensor names (for module system)
+    exports: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator) Interpreter {
         return Interpreter{
@@ -127,6 +131,8 @@ pub const Interpreter = struct {
             .default_domain_size = 100, // Default domain size
             .last_program = null,
             .trace_enabled = false,
+            .avg_counts = std.StringHashMap(DenseTensor(f64)).init(allocator),
+            .exports = std.StringHashMap(void).init(allocator),
         };
     }
 
@@ -160,6 +166,14 @@ pub const Interpreter = struct {
             schema_copy.deinit();
         }
         self.schemas.deinit();
+
+        var avg_iter = self.avg_counts.valueIterator();
+        while (avg_iter.next()) |c| {
+            var count_copy = c.*;
+            count_copy.deinit();
+        }
+        self.avg_counts.deinit();
+        self.exports.deinit();
     }
 
     /// Define a domain with a specific size
@@ -381,10 +395,45 @@ pub const Interpreter = struct {
                 try self.executeImport(im.path, im.alias);
             },
             .export_stmt => |ex| {
-                // Mark tensor as exported (for now, just validate it exists)
-                if (!self.tensors.contains(ex.name)) {
-                    // Tensor doesn't exist yet - that's OK, it might be defined later
-                    // We could track exports for validation, but for now just pass
+                // Mark tensor as exported and print its value
+                self.exports.put(ex.name, {}) catch {};
+
+                // Print exported tensor value
+                if (self.tensors.get(ex.name)) |t| {
+                    std.debug.print("export {s} = ", .{ex.name});
+                    switch (t) {
+                        .f64_dense => |dense| {
+                            if (dense.shape.rank() == 0 or dense.data.len == 1) {
+                                std.debug.print("{d}\n", .{dense.data[0]});
+                            } else if (dense.shape.rank() == 1) {
+                                std.debug.print("[", .{});
+                                for (dense.data, 0..) |v, i| {
+                                    if (i > 0) std.debug.print(", ", .{});
+                                    if (i >= 10) {
+                                        std.debug.print("... ({d} more)", .{dense.data.len - i});
+                                        break;
+                                    }
+                                    std.debug.print("{d:.4}", .{v});
+                                }
+                                std.debug.print("]\n", .{});
+                            } else {
+                                std.debug.print("<tensor shape ", .{});
+                                for (dense.shape.dims, 0..) |d, i| {
+                                    if (i > 0) std.debug.print("x", .{});
+                                    std.debug.print("{d}", .{d});
+                                }
+                                std.debug.print(">\n", .{});
+                            }
+                        },
+                        .f64_sparse => |sparse| {
+                            std.debug.print("<sparse {d} non-zeros>\n", .{sparse.nnz()});
+                        },
+                        else => {
+                            std.debug.print("<tensor>\n", .{});
+                        },
+                    }
+                } else {
+                    std.debug.print("export {s}: (not yet defined)\n", .{ex.name});
                 }
             },
             .query => |q| {
@@ -395,6 +444,10 @@ pub const Interpreter = struct {
             },
             .load_stmt => |l| {
                 try self.executeLoad(&l);
+            },
+            .backward_stmt => {
+                // Backward pass handled by codegen, not interpreter
+                // The interpreter doesn't support autodiff yet
             },
             .comment => {
                 // Comments are no-ops
@@ -447,6 +500,58 @@ pub const Interpreter = struct {
                     file.writeAll(content.items) catch return;
                     std.debug.print("Saved {s} to {s}\n", .{ name, path });
                 },
+                .f64_sparse => |sparse| {
+                    // Sparse format: shape:d1,d2,...\nnnz:count\nindices:i1,j1;i2,j2;...\nvalues:v1,v2,...
+                    var content = std.ArrayListUnmanaged(u8){};
+                    defer content.deinit(self.allocator);
+
+                    // Write shape
+                    content.appendSlice(self.allocator, "sparse\nshape:") catch return;
+                    for (sparse.shape.dims, 0..) |dim, i| {
+                        if (i > 0) content.append(self.allocator, ',') catch return;
+                        var buf: [32]u8 = undefined;
+                        const str = std.fmt.bufPrint(&buf, "{d}", .{dim}) catch continue;
+                        content.appendSlice(self.allocator, str) catch return;
+                    }
+                    content.append(self.allocator, '\n') catch return;
+
+                    // Write nnz
+                    var nnz_buf: [32]u8 = undefined;
+                    const nnz_str = std.fmt.bufPrint(&nnz_buf, "nnz:{d}\n", .{sparse.nnz()}) catch return;
+                    content.appendSlice(self.allocator, nnz_str) catch return;
+
+                    // Write indices
+                    content.appendSlice(self.allocator, "indices:") catch return;
+                    for (sparse.indices.items, 0..) |idx, i| {
+                        if (i > 0) content.append(self.allocator, ';') catch return;
+                        for (idx, 0..) |dim_idx, j| {
+                            if (j > 0) content.append(self.allocator, ',') catch return;
+                            var buf: [32]u8 = undefined;
+                            const str = std.fmt.bufPrint(&buf, "{d}", .{dim_idx}) catch continue;
+                            content.appendSlice(self.allocator, str) catch return;
+                        }
+                    }
+                    content.append(self.allocator, '\n') catch return;
+
+                    // Write values
+                    content.appendSlice(self.allocator, "values:") catch return;
+                    for (sparse.values.items, 0..) |v, i| {
+                        if (i > 0) content.append(self.allocator, ',') catch return;
+                        var buf: [64]u8 = undefined;
+                        const str = std.fmt.bufPrint(&buf, "{d}", .{v}) catch continue;
+                        content.appendSlice(self.allocator, str) catch return;
+                    }
+                    content.append(self.allocator, '\n') catch return;
+
+                    // Write to file
+                    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+                        std.debug.print("Error creating file '{s}': {}\n", .{ path, err });
+                        return;
+                    };
+                    defer file.close();
+                    file.writeAll(content.items) catch return;
+                    std.debug.print("Saved sparse {s} to {s} ({d} non-zeros)\n", .{ name, path, sparse.nnz() });
+                },
                 else => {
                     std.debug.print("Save not implemented for this tensor type\n", .{});
                 },
@@ -478,53 +583,115 @@ pub const Interpreter = struct {
         };
         const content = buf[0..bytes_read];
 
-        // Parse shape:dim1,dim2,...\ndata:v1,v2,...
         var lines = std.mem.splitSequence(u8, content, "\n");
+        const first_line = lines.next() orelse return;
 
-        // Parse shape line
-        const shape_line = lines.next() orelse return;
-        if (!std.mem.startsWith(u8, shape_line, "shape:")) return;
-        const shape_str = shape_line[6..];
+        // Check if sparse format
+        if (std.mem.eql(u8, first_line, "sparse")) {
+            // Sparse format: sparse\nshape:...\nnnz:...\nindices:...\nvalues:...
+            const shape_line = lines.next() orelse return;
+            if (!std.mem.startsWith(u8, shape_line, "shape:")) return;
+            const shape_str = shape_line[6..];
 
-        var shape = std.ArrayListUnmanaged(usize){};
-        defer shape.deinit(self.allocator);
-        var shape_parts = std.mem.splitSequence(u8, shape_str, ",");
-        while (shape_parts.next()) |part| {
-            const dim = std.fmt.parseInt(usize, part, 10) catch continue;
-            shape.append(self.allocator, dim) catch return;
-        }
+            var shape = std.ArrayListUnmanaged(usize){};
+            defer shape.deinit(self.allocator);
+            var shape_parts = std.mem.splitSequence(u8, shape_str, ",");
+            while (shape_parts.next()) |part| {
+                const dim = std.fmt.parseInt(usize, part, 10) catch continue;
+                shape.append(self.allocator, dim) catch return;
+            }
 
-        // Parse data line
-        const data_line = lines.next() orelse return;
-        if (!std.mem.startsWith(u8, data_line, "data:")) return;
-        const data_str = data_line[5..];
+            // Skip nnz line (we'll count from indices)
+            _ = lines.next();
 
-        var data = std.ArrayListUnmanaged(f64){};
-        defer data.deinit(self.allocator);
-        var data_parts = std.mem.splitSequence(u8, data_str, ",");
-        while (data_parts.next()) |part| {
-            const val = std.fmt.parseFloat(f64, part) catch continue;
-            data.append(self.allocator, val) catch return;
-        }
+            // Parse indices line
+            const indices_line = lines.next() orelse return;
+            if (!std.mem.startsWith(u8, indices_line, "indices:")) return;
+            const indices_str = indices_line[8..];
 
-        // Create tensor
-        var new_tensor = tensor.DenseTensor(f64).init(self.allocator, shape.items) catch return;
-        @memcpy(new_tensor.data[0..@min(new_tensor.data.len, data.items.len)], data.items[0..@min(new_tensor.data.len, data.items.len)]);
+            // Parse values line
+            const values_line = lines.next() orelse return;
+            if (!std.mem.startsWith(u8, values_line, "values:")) return;
+            const values_str = values_line[7..];
 
-        // Store tensor
-        if (self.tensors.getPtr(name)) |existing| {
-            existing.deinit();
-            existing.* = .{ .f64_dense = new_tensor };
+            // Create sparse tensor
+            var new_tensor = tensor.SparseTensor(f64).init(self.allocator, shape.items) catch return;
+
+            // Parse indices and values together
+            var idx_entries = std.mem.splitSequence(u8, indices_str, ";");
+            var val_entries = std.mem.splitSequence(u8, values_str, ",");
+
+            while (idx_entries.next()) |idx_str| {
+                if (idx_str.len == 0) continue;
+                const val_str = val_entries.next() orelse break;
+
+                // Parse multi-index
+                var idx = std.ArrayListUnmanaged(usize){};
+                defer idx.deinit(self.allocator);
+                var idx_parts = std.mem.splitSequence(u8, idx_str, ",");
+                while (idx_parts.next()) |part| {
+                    const dim_idx = std.fmt.parseInt(usize, part, 10) catch continue;
+                    idx.append(self.allocator, dim_idx) catch continue;
+                }
+
+                const val = std.fmt.parseFloat(f64, val_str) catch continue;
+                new_tensor.set(idx.items, val) catch continue;
+            }
+
+            // Store tensor
+            if (self.tensors.getPtr(name)) |existing| {
+                existing.deinit();
+                existing.* = .{ .f64_sparse = new_tensor };
+            } else {
+                self.tensors.put(name, .{ .f64_sparse = new_tensor }) catch return;
+            }
+
+            std.debug.print("Loaded sparse {s} from {s} ({d} non-zeros)\n", .{ name, path, new_tensor.nnz() });
         } else {
-            self.tensors.put(name, .{ .f64_dense = new_tensor }) catch return;
-        }
+            // Dense format: shape:dim1,dim2,...\ndata:v1,v2,...
+            if (!std.mem.startsWith(u8, first_line, "shape:")) return;
+            const shape_str = first_line[6..];
 
-        std.debug.print("Loaded {s} from {s} (shape: ", .{ name, path });
-        for (shape.items, 0..) |dim, i| {
-            if (i > 0) std.debug.print(",", .{});
-            std.debug.print("{d}", .{dim});
+            var shape = std.ArrayListUnmanaged(usize){};
+            defer shape.deinit(self.allocator);
+            var shape_parts = std.mem.splitSequence(u8, shape_str, ",");
+            while (shape_parts.next()) |part| {
+                const dim = std.fmt.parseInt(usize, part, 10) catch continue;
+                shape.append(self.allocator, dim) catch return;
+            }
+
+            // Parse data line
+            const data_line = lines.next() orelse return;
+            if (!std.mem.startsWith(u8, data_line, "data:")) return;
+            const data_str = data_line[5..];
+
+            var data = std.ArrayListUnmanaged(f64){};
+            defer data.deinit(self.allocator);
+            var data_parts = std.mem.splitSequence(u8, data_str, ",");
+            while (data_parts.next()) |part| {
+                const val = std.fmt.parseFloat(f64, part) catch continue;
+                data.append(self.allocator, val) catch return;
+            }
+
+            // Create tensor
+            var new_tensor = tensor.DenseTensor(f64).init(self.allocator, shape.items) catch return;
+            @memcpy(new_tensor.data[0..@min(new_tensor.data.len, data.items.len)], data.items[0..@min(new_tensor.data.len, data.items.len)]);
+
+            // Store tensor
+            if (self.tensors.getPtr(name)) |existing| {
+                existing.deinit();
+                existing.* = .{ .f64_dense = new_tensor };
+            } else {
+                self.tensors.put(name, .{ .f64_dense = new_tensor }) catch return;
+            }
+
+            std.debug.print("Loaded {s} from {s} (shape: ", .{ name, path });
+            for (shape.items, 0..) |dim, i| {
+                if (i > 0) std.debug.print(",", .{});
+                std.debug.print("{d}", .{dim});
+            }
+            std.debug.print(")\n", .{});
         }
-        std.debug.print(")\n", .{});
     }
 
     /// Execute a query statement - prints tensor value
@@ -621,13 +788,27 @@ pub const Interpreter = struct {
 
     /// Execute an import statement
     /// Loads and executes another .tl file, importing its tensors and domains
+    /// If alias is provided, tensors are prefixed: import "file.tl" as m -> X becomes m.X
     fn executeImport(self: *Interpreter, raw_path: []const u8, alias: ?[]const u8) InterpreterError!void {
-        _ = alias; // TODO: implement aliased imports (prefix tensor names)
-
         // Strip quotes from path if present (string literals include quotes)
         var path = raw_path;
         if (path.len >= 2 and path[0] == '"' and path[path.len - 1] == '"') {
             path = path[1 .. path.len - 1];
+        }
+
+        // Track existing tensor/domain names before import
+        var existing_tensors = std.StringHashMap(void).init(self.allocator);
+        defer existing_tensors.deinit();
+        var existing_domains = std.StringHashMap(void).init(self.allocator);
+        defer existing_domains.deinit();
+
+        var tensor_it = self.tensors.iterator();
+        while (tensor_it.next()) |entry| {
+            existing_tensors.put(entry.key_ptr.*, {}) catch {};
+        }
+        var domain_it = self.domains.iterator();
+        while (domain_it.next()) |entry| {
+            existing_domains.put(entry.key_ptr.*, {}) catch {};
         }
 
         // Read the file - don't free because tokens reference this memory
@@ -645,14 +826,14 @@ pub const Interpreter = struct {
         // Lex - use arena allocator
         var lex = lexer.Lexer.init(ast_allocator, source);
 
-        const tokens = lex.scanTokens() catch {
+        const toks = lex.scanTokens() catch {
             arena.deinit();
             self.allocator.free(source);
             return InterpreterError.ParseError;
         };
 
         // Parse
-        var p = parser.Parser.init(ast_allocator, tokens);
+        var p = parser.Parser.init(ast_allocator, toks);
 
         const program = p.parse() catch {
             arena.deinit();
@@ -667,6 +848,47 @@ pub const Interpreter = struct {
             self.allocator.free(source);
             return InterpreterError.ImportError;
         };
+
+        // If alias is provided, rename new tensors/domains with prefix
+        if (alias) |prefix| {
+            // Collect new tensor names
+            var new_tensors = std.ArrayListUnmanaged([]const u8){};
+            defer new_tensors.deinit(self.allocator);
+
+            var new_tensor_it = self.tensors.iterator();
+            while (new_tensor_it.next()) |entry| {
+                if (!existing_tensors.contains(entry.key_ptr.*)) {
+                    new_tensors.append(self.allocator, entry.key_ptr.*) catch {};
+                }
+            }
+
+            // Rename tensors with alias prefix
+            for (new_tensors.items) |old_name| {
+                if (self.tensors.fetchRemove(old_name)) |kv| {
+                    const new_name = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ prefix, old_name }) catch continue;
+                    self.tensors.put(new_name, kv.value) catch {};
+                }
+            }
+
+            // Collect new domain names
+            var new_domains = std.ArrayListUnmanaged([]const u8){};
+            defer new_domains.deinit(self.allocator);
+
+            var new_domain_it = self.domains.iterator();
+            while (new_domain_it.next()) |entry| {
+                if (!existing_domains.contains(entry.key_ptr.*)) {
+                    new_domains.append(self.allocator, entry.key_ptr.*) catch {};
+                }
+            }
+
+            // Rename domains with alias prefix
+            for (new_domains.items) |old_name| {
+                if (self.domains.fetchRemove(old_name)) |kv| {
+                    const new_name = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ prefix, old_name }) catch continue;
+                    self.domains.put(new_name, kv.value) catch {};
+                }
+            }
+        }
 
         // Keep arena and source alive - strings are referenced by interpreter state
         // This is a controlled memory leak for imports
@@ -923,8 +1145,51 @@ pub const Interpreter = struct {
                 }
             },
             .avg => {
-                // Running average
-                // TODO: implement
+                // Running average: new_avg = (old_sum + new_value) / (count + 1)
+                // We store sum in tensor and count separately, then compute avg on read
+                switch (lhs_tensor.*) {
+                    .f64_dense => |*t| {
+                        // Get or create count tensor
+                        const count_tensor = self.avg_counts.getPtr(eq.lhs.name) orelse blk: {
+                            const new_count = DenseTensor(f64).init(self.allocator, t.shape.dims) catch break :blk null;
+                            // Initialize counts to 1 (for existing values)
+                            for (new_count.data) |*c| {
+                                c.* = 1.0;
+                            }
+                            self.avg_counts.put(eq.lhs.name, new_count) catch break :blk null;
+                            break :blk self.avg_counts.getPtr(eq.lhs.name);
+                        };
+
+                        if (count_tensor) |counts| {
+                            switch (rhs_val) {
+                                .tensor_val => |rv| {
+                                    if (rv == .f64_dense) {
+                                        // Running average: avg = (avg * count + new) / (count + 1)
+                                        for (t.data, rv.f64_dense.data, counts.data) |*avg, new_val, *cnt| {
+                                            avg.* = (avg.* * cnt.* + new_val) / (cnt.* + 1.0);
+                                            cnt.* += 1.0;
+                                        }
+                                    }
+                                },
+                                .f64_val => |v| {
+                                    for (t.data, counts.data) |*avg, *cnt| {
+                                        avg.* = (avg.* * cnt.* + v) / (cnt.* + 1.0);
+                                        cnt.* += 1.0;
+                                    }
+                                },
+                                .i64_val => |v| {
+                                    const fv: f64 = @floatFromInt(v);
+                                    for (t.data, counts.data) |*avg, *cnt| {
+                                        avg.* = (avg.* * cnt.* + fv) / (cnt.* + 1.0);
+                                        cnt.* += 1.0;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    },
+                    else => {},
+                }
             },
         }
     }
@@ -995,7 +1260,21 @@ pub const Interpreter = struct {
                         dense.set(indices, @min(old, scalar));
                     },
                     .avg => {
-                        // For avg, we'd need a count - skip for now
+                        // Running average for single element
+                        const count_tensor = self.avg_counts.getPtr(eq.lhs.name) orelse blk: {
+                            const new_count = DenseTensor(f64).init(self.allocator, dense.shape.dims) catch break :blk null;
+                            for (new_count.data) |*c| {
+                                c.* = 1.0;
+                            }
+                            self.avg_counts.put(eq.lhs.name, new_count) catch break :blk null;
+                            break :blk self.avg_counts.getPtr(eq.lhs.name);
+                        };
+                        if (count_tensor) |counts| {
+                            const old = dense.get(indices);
+                            const cnt = counts.get(indices);
+                            dense.set(indices, (old * cnt + scalar) / (cnt + 1.0));
+                            counts.set(indices, cnt + 1.0);
+                        }
                     },
                 }
             },
@@ -1019,7 +1298,10 @@ pub const Interpreter = struct {
                         sparse.set(indices, @min(old, scalar)) catch return InterpreterError.OutOfMemory;
                     },
                     .avg => {
-                        // For avg, we'd need a count - skip for now
+                        // Sparse avg: use simple running average without auxiliary count
+                        // (sparse tensors don't have a natural count tensor)
+                        const old = sparse.get(indices);
+                        sparse.set(indices, (old + scalar) / 2.0) catch return InterpreterError.OutOfMemory;
                     },
                 }
             },
@@ -1132,6 +1414,34 @@ pub const Interpreter = struct {
             },
 
             .nonlinearity => |nl| {
+                // Special handling for concat with product expression
+                if (nl.func == .concat) {
+                    if (nl.arg.* == .product) {
+                        const prod = nl.arg.product;
+                        if (prod.factors.len == 2) {
+                            // Evaluate both factors separately and concatenate
+                            var val1 = try self.evaluateExprWithIndices(prod.factors[0], output_indices);
+                            defer val1.deinit();
+                            var val2 = try self.evaluateExprWithIndices(prod.factors[1], output_indices);
+                            defer val2.deinit();
+
+                            if (val1 == .tensor_val and val2 == .tensor_val) {
+                                const t1 = val1.tensor_val;
+                                const t2 = val2.tensor_val;
+                                if (t1 == .f64_dense and t2 == .f64_dense) {
+                                    const result = einsum.concatTensors(self.allocator, &t1.f64_dense, &t2.f64_dense) catch return InterpreterError.ShapeMismatch;
+                                    return Value{ .tensor_val = Tensor{ .f64_dense = result } };
+                                } else if (t1 == .f64_sparse and t2 == .f64_sparse) {
+                                    const result = einsum.concatSparseTensors(self.allocator, &t1.f64_sparse, &t2.f64_sparse) catch return InterpreterError.ShapeMismatch;
+                                    return Value{ .tensor_val = Tensor{ .f64_sparse = result } };
+                                }
+                            }
+                        }
+                    }
+                    // Fall through: single tensor or incompatible - return as-is
+                    return try self.evaluateExprWithIndices(nl.arg, output_indices);
+                }
+
                 // For nonlinearity, the output indices are the same as input
                 // since nonlinearity is applied element-wise
                 var arg_val = try self.evaluateExprWithIndices(nl.arg, output_indices);
@@ -1156,9 +1466,9 @@ pub const Interpreter = struct {
                                     .sqrt => einsum.sqrtTensor(dense),
                                     .sin => einsum.sinTensor(dense),
                                     .cos => einsum.cosTensor(dense),
-                                    .norm => {}, // TODO: implement norm
+                                    .norm => einsum.normTensor(dense),
                                     .lnorm => einsum.lnormTensor(dense),
-                                    .concat => {}, // Concat needs multiple tensors, no-op on single
+                                    .concat => {}, // Already handled above
                                 }
                             },
                             .f64_sparse => |*sparse| {
@@ -1167,7 +1477,14 @@ pub const Interpreter = struct {
                                     .step => einsum.stepSparseTensor(sparse),
                                     .relu => einsum.reluSparseTensor(sparse),
                                     .sigmoid => einsum.sigmoidSparseTensor(sparse),
-                                    else => {}, // Other ops not yet implemented for sparse
+                                    .tanh => einsum.tanhSparseTensor(sparse),
+                                    .exp => einsum.expSparseTensor(sparse),
+                                    .log => einsum.logSparseTensor(sparse),
+                                    .abs => einsum.absSparseTensor(sparse),
+                                    .sqrt => einsum.sqrtSparseTensor(sparse),
+                                    .sin => einsum.sinSparseTensor(sparse),
+                                    .cos => einsum.cosSparseTensor(sparse),
+                                    .softmax, .norm, .lnorm, .concat => {}, // Not applicable to sparse
                                 }
                             },
                             else => {},
@@ -1236,7 +1553,7 @@ pub const Interpreter = struct {
                     return Value{ .tensor_val = Tensor{ .f64_dense = result_dense } };
                 }
 
-                // Handle tensor-scalar operations
+                // Handle tensor-scalar operations (f64)
                 if (left == .tensor_val and right == .f64_val) {
                     var result_tensor = switch (left.tensor_val) {
                         .f64_dense => |d| d.clone(self.allocator) catch return InterpreterError.OutOfMemory,
@@ -1254,13 +1571,47 @@ pub const Interpreter = struct {
                     return Value{ .tensor_val = Tensor{ .f64_dense = result_tensor } };
                 }
 
-                // Handle scalar-tensor operations
+                // Handle tensor-scalar operations (i64 -> convert to f64)
+                if (left == .tensor_val and right == .i64_val) {
+                    var result_tensor = switch (left.tensor_val) {
+                        .f64_dense => |d| d.clone(self.allocator) catch return InterpreterError.OutOfMemory,
+                        else => return InterpreterError.NotImplemented,
+                    };
+                    const scalar: f64 = @floatFromInt(right.i64_val);
+
+                    switch (bin.op) {
+                        .add => einsum.addScalar(&result_tensor, scalar),
+                        .sub => einsum.addScalar(&result_tensor, -scalar),
+                        .mul => einsum.mulScalar(&result_tensor, scalar),
+                        .div => einsum.mulScalar(&result_tensor, 1.0 / scalar),
+                        else => return InterpreterError.NotImplemented,
+                    }
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result_tensor } };
+                }
+
+                // Handle scalar-tensor operations (f64)
                 if (left == .f64_val and right == .tensor_val) {
                     var result_tensor = switch (right.tensor_val) {
                         .f64_dense => |d| d.clone(self.allocator) catch return InterpreterError.OutOfMemory,
                         else => return InterpreterError.NotImplemented,
                     };
                     const scalar = left.f64_val;
+
+                    switch (bin.op) {
+                        .add => einsum.addScalar(&result_tensor, scalar),
+                        .mul => einsum.mulScalar(&result_tensor, scalar),
+                        else => return InterpreterError.NotImplemented,
+                    }
+                    return Value{ .tensor_val = Tensor{ .f64_dense = result_tensor } };
+                }
+
+                // Handle scalar-tensor operations (i64 -> convert to f64)
+                if (left == .i64_val and right == .tensor_val) {
+                    var result_tensor = switch (right.tensor_val) {
+                        .f64_dense => |d| d.clone(self.allocator) catch return InterpreterError.OutOfMemory,
+                        else => return InterpreterError.NotImplemented,
+                    };
+                    const scalar: f64 = @floatFromInt(left.i64_val);
 
                     switch (bin.op) {
                         .add => einsum.addScalar(&result_tensor, scalar),

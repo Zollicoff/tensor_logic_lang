@@ -4,11 +4,27 @@ const frontend = @import("frontend");
 const Lexer = frontend.Lexer;
 const Parser = frontend.Parser;
 const ast = frontend.ast;
+const tokens = frontend.tokens;
+
+/// Symbol information for hover/go-to-definition
+const SymbolInfo = struct {
+    name: []const u8,
+    kind: SymbolKind,
+    location: tokens.SourceLocation,
+    detail: []const u8, // Type info, domain size, etc.
+
+    const SymbolKind = enum {
+        tensor,
+        domain,
+        sparse_relation,
+    };
+};
 
 /// LSP Server for Tensor Logic
 pub const LspServer = struct {
     allocator: std.mem.Allocator,
     documents: std.StringHashMap(Document),
+    symbols: std.StringHashMap(std.ArrayListUnmanaged(SymbolInfo)),
     initialized: bool,
     shutdown_requested: bool,
 
@@ -22,6 +38,7 @@ pub const LspServer = struct {
         return .{
             .allocator = allocator,
             .documents = std.StringHashMap(Document).init(allocator),
+            .symbols = std.StringHashMap(std.ArrayListUnmanaged(SymbolInfo)).init(allocator),
             .initialized = false,
             .shutdown_requested = false,
         };
@@ -35,6 +52,15 @@ pub const LspServer = struct {
             self.allocator.free(entry.value_ptr.uri);
         }
         self.documents.deinit();
+
+        var sym_it = self.symbols.iterator();
+        while (sym_it.next()) |entry| {
+            for (entry.value_ptr.items) |sym| {
+                self.allocator.free(sym.detail);
+            }
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.symbols.deinit();
     }
 
     /// Main loop - read JSON-RPC messages from stdin, process, respond on stdout
@@ -134,6 +160,10 @@ pub const LspServer = struct {
             return null;
         } else if (std.mem.eql(u8, method_str, "textDocument/hover")) {
             return try self.handleHover(root, id);
+        } else if (std.mem.eql(u8, method_str, "textDocument/definition")) {
+            return try self.handleDefinition(root, id);
+        } else if (std.mem.eql(u8, method_str, "textDocument/completion")) {
+            return try self.handleCompletion(root, id);
         }
 
         return null;
@@ -147,7 +177,11 @@ pub const LspServer = struct {
             \\      "openClose": true,
             \\      "change": 1
             \\    },
-            \\    "hoverProvider": true
+            \\    "hoverProvider": true,
+            \\    "definitionProvider": true,
+            \\    "completionProvider": {
+            \\      "triggerCharacters": ["[", "(", "=", " "]
+            \\    }
             \\  },
             \\  "serverInfo": {
             \\    "name": "tensor-logic-lsp",
@@ -216,28 +250,220 @@ pub const LspServer = struct {
         const uri = text_doc.object.get("uri") orelse return self.makeResponse(id, .null);
         const position = params.object.get("position") orelse return self.makeResponse(id, .null);
 
-        const line = position.object.get("line") orelse return self.makeResponse(id, .null);
-        const char = position.object.get("character") orelse return self.makeResponse(id, .null);
-
-        _ = line;
-        _ = char;
+        const line_num = position.object.get("line") orelse return self.makeResponse(id, .null);
+        const char_num = position.object.get("character") orelse return self.makeResponse(id, .null);
 
         // Get document content
         const doc = self.documents.get(uri.string) orelse return self.makeResponse(id, .null);
-        _ = doc;
 
-        // TODO: Find token at position such as tensor names, provide type/shape info
-        // For now, return a simple message
-        const hover_response =
-            \\{
-            \\  "contents": {
-            \\    "kind": "markdown",
-            \\    "value": "**Tensor Logic**\n\nHover information coming soon!"
-            \\  }
-            \\}
-        ;
+        // Find the word at the cursor position
+        const word = self.getWordAtPosition(doc.content, @intCast(line_num.integer), @intCast(char_num.integer)) orelse return self.makeResponse(id, .null);
 
-        return try self.makeResponseRaw(id, hover_response);
+        // Look up symbol info
+        if (self.symbols.get(uri.string)) |syms| {
+            for (syms.items) |sym| {
+                if (std.mem.eql(u8, sym.name, word)) {
+                    const kind_str = switch (sym.kind) {
+                        .tensor => "Tensor",
+                        .domain => "Domain",
+                        .sparse_relation => "Sparse Relation",
+                    };
+                    const hover_response = try std.fmt.allocPrint(self.allocator,
+                        \\{{
+                        \\  "contents": {{
+                        \\    "kind": "markdown",
+                        \\    "value": "**{s}** `{s}`\n\n{s}"
+                        \\  }}
+                        \\}}
+                    , .{ kind_str, sym.name, sym.detail });
+                    defer self.allocator.free(hover_response);
+                    return try self.makeResponseRaw(id, hover_response);
+                }
+            }
+        }
+
+        // Check if it's a keyword or nonlinearity
+        if (self.getKeywordHover(word)) |info| {
+            const hover_response = try std.fmt.allocPrint(self.allocator,
+                \\{{
+                \\  "contents": {{
+                \\    "kind": "markdown",
+                \\    "value": "{s}"
+                \\  }}
+                \\}}
+            , .{info});
+            defer self.allocator.free(hover_response);
+            return try self.makeResponseRaw(id, hover_response);
+        }
+
+        return self.makeResponse(id, .null);
+    }
+
+    fn handleDefinition(self: *LspServer, root: json.Value, id: ?json.Value) ![]const u8 {
+        const params = root.object.get("params") orelse return self.makeResponse(id, .null);
+        const text_doc = params.object.get("textDocument") orelse return self.makeResponse(id, .null);
+        const uri = text_doc.object.get("uri") orelse return self.makeResponse(id, .null);
+        const position = params.object.get("position") orelse return self.makeResponse(id, .null);
+
+        const line_num = position.object.get("line") orelse return self.makeResponse(id, .null);
+        const char_num = position.object.get("character") orelse return self.makeResponse(id, .null);
+
+        // Get document content
+        const doc = self.documents.get(uri.string) orelse return self.makeResponse(id, .null);
+
+        // Find the word at the cursor position
+        const word = self.getWordAtPosition(doc.content, @intCast(line_num.integer), @intCast(char_num.integer)) orelse return self.makeResponse(id, .null);
+
+        // Look up symbol location
+        if (self.symbols.get(uri.string)) |syms| {
+            for (syms.items) |sym| {
+                if (std.mem.eql(u8, sym.name, word)) {
+                    // LSP uses 0-based lines, our parser uses 1-based
+                    const def_line = if (sym.location.line > 0) sym.location.line - 1 else 0;
+                    const def_response = try std.fmt.allocPrint(self.allocator,
+                        \\{{
+                        \\  "uri": "{s}",
+                        \\  "range": {{
+                        \\    "start": {{ "line": {d}, "character": {d} }},
+                        \\    "end": {{ "line": {d}, "character": {d} }}
+                        \\  }}
+                        \\}}
+                    , .{ uri.string, def_line, sym.location.column, def_line, sym.location.column + sym.name.len });
+                    defer self.allocator.free(def_response);
+                    return try self.makeResponseRaw(id, def_response);
+                }
+            }
+        }
+
+        return self.makeResponse(id, .null);
+    }
+
+    fn handleCompletion(self: *LspServer, root: json.Value, id: ?json.Value) ![]const u8 {
+        const params = root.object.get("params") orelse return self.makeResponse(id, .null);
+        const text_doc = params.object.get("textDocument") orelse return self.makeResponse(id, .null);
+        const uri = text_doc.object.get("uri") orelse return self.makeResponse(id, .null);
+
+        var completions = std.ArrayListUnmanaged(u8){};
+        defer completions.deinit(self.allocator);
+
+        try completions.appendSlice(self.allocator, "[");
+        var first = true;
+
+        // Add keywords
+        const keywords = [_][]const u8{ "domain", "sparse", "import", "export", "if", "else", "save", "load" };
+        for (keywords) |kw| {
+            if (!first) try completions.appendSlice(self.allocator, ",");
+            first = false;
+            const item = try std.fmt.allocPrint(self.allocator,
+                \\{{"label": "{s}", "kind": 14, "detail": "keyword"}}
+            , .{kw});
+            defer self.allocator.free(item);
+            try completions.appendSlice(self.allocator, item);
+        }
+
+        // Add nonlinearities
+        const nonlinearities = [_][]const u8{ "step", "relu", "sigmoid", "softmax", "tanh", "exp", "log", "abs", "sqrt", "sin", "cos", "norm", "lnorm", "concat" };
+        for (nonlinearities) |nl| {
+            if (!first) try completions.appendSlice(self.allocator, ",");
+            first = false;
+            const item = try std.fmt.allocPrint(self.allocator,
+                \\{{"label": "{s}", "kind": 3, "detail": "nonlinearity"}}
+            , .{nl});
+            defer self.allocator.free(item);
+            try completions.appendSlice(self.allocator, item);
+        }
+
+        // Add defined tensors/domains from this document
+        if (self.symbols.get(uri.string)) |syms| {
+            for (syms.items) |sym| {
+                if (!first) try completions.appendSlice(self.allocator, ",");
+                first = false;
+                const kind: u8 = switch (sym.kind) {
+                    .tensor => 6, // Variable
+                    .domain => 22, // Struct
+                    .sparse_relation => 5, // Field
+                };
+                const item = try std.fmt.allocPrint(self.allocator,
+                    \\{{"label": "{s}", "kind": {d}, "detail": "{s}"}}
+                , .{ sym.name, kind, sym.detail });
+                defer self.allocator.free(item);
+                try completions.appendSlice(self.allocator, item);
+            }
+        }
+
+        try completions.appendSlice(self.allocator, "]");
+
+        return try self.makeResponseRaw(id, completions.items);
+    }
+
+    /// Get word at a given line/character position
+    fn getWordAtPosition(self: *LspServer, content: []const u8, line: usize, character: usize) ?[]const u8 {
+        _ = self;
+        var current_line: usize = 0;
+        var line_start: usize = 0;
+
+        // Find the start of the requested line
+        for (content, 0..) |c, i| {
+            if (current_line == line) {
+                line_start = i;
+                break;
+            }
+            if (c == '\n') {
+                current_line += 1;
+            }
+        }
+
+        // Find position in line
+        const pos = line_start + character;
+        if (pos >= content.len) return null;
+
+        // Find word boundaries
+        var start = pos;
+        while (start > 0 and isIdentChar(content[start - 1])) {
+            start -= 1;
+        }
+
+        var end = pos;
+        while (end < content.len and isIdentChar(content[end])) {
+            end += 1;
+        }
+
+        if (start == end) return null;
+        return content[start..end];
+    }
+
+    fn isIdentChar(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+    }
+
+    fn getKeywordHover(self: *LspServer, word: []const u8) ?[]const u8 {
+        _ = self;
+        const keyword_info = [_]struct { name: []const u8, info: []const u8 }{
+            .{ .name = "domain", .info = "**domain** - Declare index domain size\\n\\n`domain Person: 100`" },
+            .{ .name = "sparse", .info = "**sparse** - Declare sparse Boolean relation\\n\\n`sparse Parent(x: Person, y: Person)`" },
+            .{ .name = "import", .info = "**import** - Import definitions from file\\n\\n`import \\\"path.tl\\\"`" },
+            .{ .name = "export", .info = "**export** - Export tensor for external use\\n\\n`export TensorName`" },
+            .{ .name = "save", .info = "**save** - Save tensor to file\\n\\n`save Weights \\\"weights.bin\\\"`" },
+            .{ .name = "load", .info = "**load** - Load tensor from file\\n\\n`load Weights \\\"weights.bin\\\"`" },
+            .{ .name = "if", .info = "**if** - Conditional expression\\n\\n`Y[i] = if X[i] > 0 then X[i] else 0`" },
+            .{ .name = "step", .info = "**step** - Heaviside step function\\n\\n`H(x) = 1 if x > 0, else 0`" },
+            .{ .name = "relu", .info = "**relu** - Rectified Linear Unit\\n\\n`relu(x) = max(0, x)`" },
+            .{ .name = "sigmoid", .info = "**sigmoid** - Logistic sigmoid\\n\\n`sigmoid(x) = 1 / (1 + exp(-x))`" },
+            .{ .name = "softmax", .info = "**softmax** - Softmax normalization\\n\\n`softmax(x_i) = exp(x_i) / sum_j(exp(x_j))`" },
+            .{ .name = "tanh", .info = "**tanh** - Hyperbolic tangent\\n\\n`tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))`" },
+            .{ .name = "exp", .info = "**exp** - Exponential function\\n\\n`exp(x) = e^x`" },
+            .{ .name = "log", .info = "**log** - Natural logarithm\\n\\n`log(x) = ln(x)`" },
+            .{ .name = "lnorm", .info = "**lnorm** - Layer normalization\\n\\n`(x - mean) / std` per row" },
+            .{ .name = "norm", .info = "**norm** - L2 norm\\n\\n`||x||_2 = sqrt(sum(x_i^2))`" },
+            .{ .name = "concat", .info = "**concat** - Concatenation along axis" },
+        };
+
+        for (keyword_info) |kw| {
+            if (std.mem.eql(u8, word, kw.name)) {
+                return kw.info;
+            }
+        }
+        return null;
     }
 
     fn publishDiagnostics(self: *LspServer, uri: []const u8, content: []const u8) !void {
@@ -245,7 +471,7 @@ pub const LspServer = struct {
 
         // Try to parse the document
         var lexer = Lexer.init(self.allocator, content);
-        const tokens = lexer.scanTokens() catch {
+        const toks = lexer.scanTokens() catch {
             // Lexer error - report it
             const diag = try std.fmt.allocPrint(self.allocator,
                 \\{{
@@ -267,10 +493,10 @@ pub const LspServer = struct {
             try self.sendNotification(stdout_file, diag);
             return;
         };
-        defer self.allocator.free(tokens);
+        defer self.allocator.free(toks);
 
-        var parser = Parser.init(self.allocator, tokens);
-        _ = parser.parse() catch {
+        var parser = Parser.init(self.allocator, toks);
+        const program = parser.parse() catch {
             // Parser error - report it
             const errors = parser.getErrors();
             var diag_items = std.ArrayListUnmanaged(u8){};
@@ -306,6 +532,9 @@ pub const LspServer = struct {
             return;
         };
 
+        // Extract symbols from AST
+        try self.extractSymbols(uri, &program);
+
         // No errors - clear diagnostics
         const clear_diag = try std.fmt.allocPrint(self.allocator,
             \\{{
@@ -319,6 +548,98 @@ pub const LspServer = struct {
         , .{uri});
         defer self.allocator.free(clear_diag);
         try self.sendNotification(stdout_file, clear_diag);
+    }
+
+    fn extractSymbols(self: *LspServer, uri: []const u8, program: *const ast.Program) !void {
+        // Clear existing symbols for this document
+        if (self.symbols.getPtr(uri)) |existing| {
+            for (existing.items) |sym| {
+                self.allocator.free(sym.detail);
+            }
+            existing.clearRetainingCapacity();
+        } else {
+            try self.symbols.put(uri, std.ArrayListUnmanaged(SymbolInfo){});
+        }
+
+        const syms = self.symbols.getPtr(uri).?;
+
+        for (program.statements) |stmt| {
+            switch (stmt) {
+                .domain_decl => |d| {
+                    const detail = if (d.size) |size|
+                        try std.fmt.allocPrint(self.allocator, "size: {d}", .{size})
+                    else
+                        try self.allocator.dupe(u8, "size: inferred");
+                    try syms.append(self.allocator, .{
+                        .name = d.name,
+                        .kind = .domain,
+                        .location = d.location,
+                        .detail = detail,
+                    });
+                },
+                .sparse_decl => |s| {
+                    var detail_buf = std.ArrayListUnmanaged(u8){};
+                    defer detail_buf.deinit(self.allocator);
+                    try detail_buf.appendSlice(self.allocator, "indices: ");
+                    for (s.indices, 0..) |idx, i| {
+                        if (i > 0) try detail_buf.appendSlice(self.allocator, ", ");
+                        try detail_buf.appendSlice(self.allocator, idx.name);
+                        if (idx.domain) |dom| {
+                            try detail_buf.appendSlice(self.allocator, ": ");
+                            try detail_buf.appendSlice(self.allocator, dom);
+                        }
+                    }
+                    const detail = try self.allocator.dupe(u8, detail_buf.items);
+                    try syms.append(self.allocator, .{
+                        .name = s.name,
+                        .kind = .sparse_relation,
+                        .location = s.location,
+                        .detail = detail,
+                    });
+                },
+                .equation => |eq| {
+                    // Check if this tensor is already defined
+                    var found = false;
+                    for (syms.items) |sym| {
+                        if (std.mem.eql(u8, sym.name, eq.lhs.name)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        // Build detail string from indices
+                        var detail_buf = std.ArrayListUnmanaged(u8){};
+                        defer detail_buf.deinit(self.allocator);
+                        const type_str = if (eq.lhs.is_boolean) "Boolean" else "Real";
+                        try detail_buf.appendSlice(self.allocator, type_str);
+                        if (eq.lhs.indices.len > 0) {
+                            try detail_buf.appendSlice(self.allocator, " [");
+                            for (eq.lhs.indices, 0..) |idx, i| {
+                                if (i > 0) try detail_buf.appendSlice(self.allocator, ", ");
+                                switch (idx) {
+                                    .name => |n| try detail_buf.appendSlice(self.allocator, n),
+                                    .constant => |c| {
+                                        const num = try std.fmt.allocPrint(self.allocator, "{d}", .{c});
+                                        defer self.allocator.free(num);
+                                        try detail_buf.appendSlice(self.allocator, num);
+                                    },
+                                    else => try detail_buf.appendSlice(self.allocator, "..."),
+                                }
+                            }
+                            try detail_buf.appendSlice(self.allocator, "]");
+                        }
+                        const detail = try self.allocator.dupe(u8, detail_buf.items);
+                        try syms.append(self.allocator, .{
+                            .name = eq.lhs.name,
+                            .kind = .tensor,
+                            .location = eq.location,
+                            .detail = detail,
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
     }
 
     fn sendNotification(self: *LspServer, file: std.fs.File, msg: []const u8) !void {

@@ -569,6 +569,55 @@ pub fn sigmoidSparseTensor(t: *SparseTensor(f64)) void {
     }
 }
 
+/// Apply tanh to sparse tensor
+pub fn tanhSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = tanh_fn(v.*);
+    }
+}
+
+/// Apply exp to sparse tensor
+pub fn expSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = exp_fn(v.*);
+    }
+}
+
+/// Apply log to sparse tensor (careful: log(0) is undefined)
+pub fn logSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = log_fn(v.*);
+    }
+}
+
+/// Apply abs to sparse tensor
+pub fn absSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = abs_fn(v.*);
+    }
+}
+
+/// Apply sqrt to sparse tensor
+pub fn sqrtSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = sqrt_fn(v.*);
+    }
+}
+
+/// Apply sin to sparse tensor
+pub fn sinSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = sin_fn(v.*);
+    }
+}
+
+/// Apply cos to sparse tensor
+pub fn cosSparseTensor(t: *SparseTensor(f64)) void {
+    for (t.values.items) |*v| {
+        v.* = cos_fn(v.*);
+    }
+}
+
 // ============================================================================
 // Nonlinearity functions (activation functions)
 // ============================================================================
@@ -613,20 +662,23 @@ pub fn sigmoidTensor(t: *DenseTensor(f64)) void {
 /// Softmax over last dimension
 pub fn softmax(allocator: std.mem.Allocator, t: *DenseTensor(f64)) !void {
     _ = allocator;
-    // For 1D tensor, softmax is straightforward
-    if (t.shape.rank() == 1) {
-        softmax1D(t.data);
-    } else if (t.shape.rank() == 2) {
-        // For 2D tensor, apply softmax over last dimension (each row)
-        const rows = t.shape.dims[0];
-        const cols = t.shape.dims[1];
-        for (0..rows) |i| {
-            const start = i * cols;
-            const end = start + cols;
-            softmax1D(t.data[start..end]);
-        }
+    const rank = t.shape.rank();
+    if (rank == 0) return;
+
+    // For any rank, apply softmax over the last dimension
+    // Calculate the size of the last dimension and the number of "rows"
+    const last_dim = t.shape.dims[rank - 1];
+    var num_rows: usize = 1;
+    for (0..rank - 1) |i| {
+        num_rows *= t.shape.dims[i];
     }
-    // TODO: handle higher-rank tensors
+
+    // Apply softmax to each row (slice along last dimension)
+    for (0..num_rows) |row| {
+        const start = row * last_dim;
+        const end = start + last_dim;
+        softmax1D(t.data[start..end]);
+    }
 }
 
 /// Apply softmax to a 1D slice
@@ -789,6 +841,42 @@ pub fn cosTensor(t: *DenseTensor(f64)) void {
     }
 }
 
+/// L2 Norm: sqrt(sum(x^2))
+/// Computes L2 norm over the last dimension
+/// Stores norm in first element of each row, zeros the rest
+pub fn normTensor(t: *DenseTensor(f64)) void {
+    const rank = t.shape.rank();
+    if (rank == 0) return;
+
+    // Calculate the size of the last dimension and the number of "rows"
+    const last_dim = t.shape.dims[rank - 1];
+    var num_rows: usize = 1;
+    for (0..rank - 1) |i| {
+        num_rows *= t.shape.dims[i];
+    }
+
+    // For 1D tensor (num_rows = 1), compute norm of entire vector
+    // For higher rank, compute norm for each slice along last dimension
+    for (0..num_rows) |row_idx| {
+        const start = row_idx * last_dim;
+        const end = start + last_dim;
+        const row = t.data[start..end];
+
+        // Compute L2 norm
+        var sum_sq: f64 = 0.0;
+        for (row) |x| {
+            sum_sq += x * x;
+        }
+        const norm_val = @sqrt(sum_sq);
+
+        // Store norm in first element, zero the rest
+        t.data[start] = norm_val;
+        for (t.data[start + 1 .. end]) |*x| {
+            x.* = 0.0;
+        }
+    }
+}
+
 /// Layer Normalization: (x - mean) / sqrt(var + eps)
 /// Normalizes over the last axis for 2D tensors, or the full tensor for 1D
 const LNORM_EPS: f64 = 1e-5;
@@ -820,22 +908,106 @@ fn layerNorm1D(data: []f64) void {
 }
 
 /// Apply layer normalization to tensor
-/// For 1D: normalizes the entire tensor
-/// For 2D: normalizes each row (last axis)
+/// Normalizes over the last axis for any rank
 pub fn lnormTensor(t: *DenseTensor(f64)) void {
-    if (t.shape.rank() == 1) {
-        layerNorm1D(t.data);
-    } else if (t.shape.rank() == 2) {
-        const rows = t.shape.dims[0];
-        const cols = t.shape.dims[1];
-        for (0..rows) |i| {
-            const start = i * cols;
-            const end = start + cols;
-            layerNorm1D(t.data[start..end]);
-        }
+    const rank = t.shape.rank();
+    if (rank == 0) return;
+
+    // Calculate the size of the last dimension and the number of "rows"
+    const last_dim = t.shape.dims[rank - 1];
+    var num_rows: usize = 1;
+    for (0..rank - 1) |i| {
+        num_rows *= t.shape.dims[i];
     }
-    // Higher rank tensors: normalize over the last axis
-    // TODO: implement for rank > 2
+
+    // Apply layer norm to each slice along the last dimension
+    for (0..num_rows) |row_idx| {
+        const start = row_idx * last_dim;
+        const end = start + last_dim;
+        layerNorm1D(t.data[start..end]);
+    }
+}
+
+/// Concatenate two sparse tensors along the last axis
+pub fn concatSparseTensors(allocator: std.mem.Allocator, a: *const SparseTensor(f64), b: *const SparseTensor(f64)) !SparseTensor(f64) {
+    const rank_a = a.shape.rank();
+    const rank_b = b.shape.rank();
+
+    if (rank_a != rank_b) return error.ShapeMismatch;
+    if (rank_a == 0) return error.ShapeMismatch;
+
+    // Check that all dims except last match
+    for (0..rank_a - 1) |i| {
+        if (a.shape.dims[i] != b.shape.dims[i]) return error.ShapeMismatch;
+    }
+
+    // Create new shape with concatenated last dimension
+    var new_shape = try allocator.alloc(usize, rank_a);
+    defer allocator.free(new_shape);
+    @memcpy(new_shape[0 .. rank_a - 1], a.shape.dims[0 .. rank_a - 1]);
+    new_shape[rank_a - 1] = a.shape.dims[rank_a - 1] + b.shape.dims[rank_a - 1];
+
+    var result = try SparseTensor(f64).init(allocator, new_shape);
+
+    // Copy entries from a
+    for (a.indices.items, a.values.items) |idx, val| {
+        try result.set(idx, val);
+    }
+
+    // Copy entries from b with offset on last dimension
+    const offset = a.shape.dims[rank_a - 1];
+    for (b.indices.items, b.values.items) |idx, val| {
+        var new_idx = try allocator.alloc(usize, idx.len);
+        defer allocator.free(new_idx);
+        @memcpy(new_idx, idx);
+        new_idx[rank_a - 1] += offset;
+        try result.set(new_idx, val);
+    }
+
+    return result;
+}
+
+/// Concatenate two tensors along the last axis
+/// For 1D: [a,b,c] concat [d,e] = [a,b,c,d,e]
+/// For 2D: [[a,b],[c,d]] concat [[e],[f]] = [[a,b,e],[c,d,f]]
+pub fn concatTensors(allocator: std.mem.Allocator, a: *const DenseTensor(f64), b: *const DenseTensor(f64)) !DenseTensor(f64) {
+    const rank_a = a.shape.rank();
+    const rank_b = b.shape.rank();
+
+    // Must have same rank
+    if (rank_a != rank_b) return error.ShapeMismatch;
+
+    if (rank_a == 1) {
+        // Simple 1D concatenation
+        const new_len = a.shape.dims[0] + b.shape.dims[0];
+        var result = try DenseTensor(f64).init(allocator, &[_]usize{new_len});
+        @memcpy(result.data[0..a.data.len], a.data);
+        @memcpy(result.data[a.data.len..], b.data);
+        return result;
+    } else if (rank_a == 2) {
+        // 2D: concatenate along last axis (columns)
+        const rows = a.shape.dims[0];
+        if (b.shape.dims[0] != rows) return error.ShapeMismatch;
+
+        const cols_a = a.shape.dims[1];
+        const cols_b = b.shape.dims[1];
+        const new_cols = cols_a + cols_b;
+
+        var result = try DenseTensor(f64).init(allocator, &[_]usize{ rows, new_cols });
+
+        for (0..rows) |i| {
+            // Copy row from a
+            const a_start = i * cols_a;
+            const r_start = i * new_cols;
+            @memcpy(result.data[r_start .. r_start + cols_a], a.data[a_start .. a_start + cols_a]);
+            // Copy row from b
+            const b_start = i * cols_b;
+            @memcpy(result.data[r_start + cols_a .. r_start + new_cols], b.data[b_start .. b_start + cols_b]);
+        }
+        return result;
+    }
+
+    return error.NotImplemented;
 }
 
 // ============================================================================

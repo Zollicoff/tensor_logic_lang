@@ -139,6 +139,9 @@ pub const Parser = struct {
         if (self.check(.kw_load)) {
             return self.parseLoad();
         }
+        if (self.check(.kw_backward)) {
+            return self.parseBackward();
+        }
 
         // Otherwise, it should be an equation
         return self.parseEquation();
@@ -199,6 +202,54 @@ pub const Parser = struct {
             .load_stmt = ast.Load{
                 .tensor_name = name,
                 .path = path,
+                .location = location,
+            },
+        };
+    }
+
+    fn parseBackward(self: *Parser) ParseError!ast.Statement {
+        const location = self.peek().location;
+        _ = self.advance(); // consume 'backward'
+
+        // Expect loss tensor name
+        if (!self.check(.identifier)) {
+            self.recordError("expected loss tensor name after 'backward'");
+            return ParseError.ExpectedIdentifier;
+        }
+        const loss = self.advance().lexeme;
+
+        // Expect 'wrt' keyword
+        if (!self.check(.kw_wrt)) {
+            self.recordError("expected 'wrt' after loss tensor");
+            return ParseError.UnexpectedToken;
+        }
+        _ = self.advance(); // consume 'wrt'
+
+        // Parse parameter list (comma-separated identifiers)
+        var params = std.ArrayListUnmanaged([]const u8){};
+
+        if (!self.check(.identifier)) {
+            self.recordError("expected parameter name after 'wrt'");
+            return ParseError.ExpectedIdentifier;
+        }
+        params.append(self.allocator, self.advance().lexeme) catch return ParseError.OutOfMemory;
+
+        // Parse additional parameters
+        while (self.match(.comma)) {
+            if (!self.check(.identifier)) {
+                self.recordError("expected parameter name after ','");
+                return ParseError.ExpectedIdentifier;
+            }
+            params.append(self.allocator, self.advance().lexeme) catch return ParseError.OutOfMemory;
+        }
+
+        // Consume newline
+        if (self.check(.newline)) _ = self.advance();
+
+        return ast.Statement{
+            .backward_stmt = ast.Backward{
+                .loss = loss,
+                .params = params.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
                 .location = location,
             },
         };

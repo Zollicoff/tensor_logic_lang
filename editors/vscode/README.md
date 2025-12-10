@@ -54,10 +54,10 @@ The extension provides highlighting for:
 ## Language Server Features
 
 The `tlc-lsp` language server provides:
-- Parse error diagnostics
-- (Planned) Hover for tensor shapes
-- (Planned) Go to definition
-- (Planned) Autocomplete
+- **Parse error diagnostics** - Real-time error reporting as you type
+- **Hover information** - Hover over tensors, domains, and keywords to see type info and documentation
+- **Go to definition** - Jump to tensor/domain definitions with F12 or Ctrl+Click
+- **Autocomplete** - Suggestions for keywords, nonlinearities, and defined tensors
 
 ## Development
 

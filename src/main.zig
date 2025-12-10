@@ -8,6 +8,7 @@ const ast = @import("frontend/ast.zig");
 const types = @import("frontend/types.zig");
 const interpreter = @import("runtime/interpreter.zig");
 const tensor_mod = @import("runtime/tensor.zig");
+const llvm_codegen = @import("codegen/llvm.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -73,6 +74,33 @@ pub fn main() !void {
             return;
         }
         try checkFile(allocator, args[2]);
+    } else if (std.mem.eql(u8, command, "compile")) {
+        if (args.len < 3) {
+            std.debug.print("Error: 'compile' command requires a file path\n", .{});
+            return;
+        }
+        // Parse compile flags: -o <output>, --emit-llvm
+        var output_path: ?[]const u8 = null;
+        var file_path: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+                i += 1;
+                if (i < args.len) {
+                    output_path = args[i];
+                }
+            } else if (std.mem.eql(u8, arg, "--emit-llvm")) {
+                // Default behavior, just emit LLVM IR
+            } else if (file_path == null) {
+                file_path = arg;
+            }
+        }
+        if (file_path) |path| {
+            try compileFile(allocator, path, output_path);
+        } else {
+            std.debug.print("Error: 'compile' command requires a file path\n", .{});
+        }
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
@@ -94,26 +122,30 @@ fn printUsage() !void {
         \\Usage: tlc <command> [options] [file]
         \\
         \\Commands:
-        \\  repl                 Start interactive REPL (Read-Eval-Print Loop)
+        \\  compile <file>       Compile to LLVM IR (the primary command)
+        \\  compile <file> -o f  Compile and write LLVM IR to file
+        \\  check <file>         Type check a .tl file
         \\  lex <file>           Tokenize a .tl file and print tokens
         \\  parse <file>         Parse a .tl file and print AST summary
-        \\  check <file>         Type check a .tl file (Boolean vs Real inference)
-        \\  run <file>           Execute a .tl program (single pass)
-        \\  run -f <file>        Execute with fixpoint iteration (for recursive rules)
+        \\  run <file>           Execute via interpreter (for testing only)
+        \\  repl                 Start interactive REPL (uses interpreter)
         \\  help                 Show this help message
         \\  version              Show version information
         \\
-        \\Options:
-        \\  -f, --fixpoint       Run until convergence (for recursive rules like Ancestor)
-        \\  -t, --trace          Enable trace mode (print execution details to stderr)
-        \\  -O, --optimize       Enable AST optimizations (constant folding)
+        \\Compile Options:
+        \\  -o, --output <file>  Write LLVM IR to file (default: stdout)
+        \\  --emit-llvm          Emit LLVM IR (default)
+        \\
+        \\Run Options (interpreter, for testing):
+        \\  -f, --fixpoint       Run until convergence (for recursive rules)
+        \\  -t, --trace          Enable trace mode
+        \\  -O, --optimize       Enable AST optimizations
         \\
         \\Examples:
-        \\  tlc repl
-        \\  tlc lex examples/matmul.tl
-        \\  tlc parse examples/ancestor.tl
-        \\  tlc run examples/matmul.tl
-        \\  tlc run -f examples/ancestor.tl
+        \\  tlc compile examples/matmul.tl -o matmul.ll
+        \\  clang matmul.ll -o matmul -lm && ./matmul
+        \\  tlc check examples/ancestor.tl
+        \\  tlc run -f examples/ancestor.tl  (interpreter, for testing)
         \\
         \\REPL Commands:
         \\  :help                Show REPL help
@@ -271,6 +303,9 @@ fn runRepl(allocator: std.mem.Allocator) !void {
                 },
                 .load_stmt => |l| {
                     printFmt(allocator, stdout, "  load {s}\n", .{l.tensor_name});
+                },
+                .backward_stmt => |b| {
+                    printFmt(allocator, stdout, "  backward {s} wrt {d} params\n", .{ b.loss, b.params.len });
                 },
                 .comment => {},
             }
@@ -524,6 +559,72 @@ fn loadFile(interp: *interpreter.Interpreter, allocator: std.mem.Allocator, aren
     printFmt(allocator, file, "Loaded {s}: {d} statement(s)\n", .{ path, program.statements.len });
 }
 
+fn compileFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]const u8) !void {
+    const stdout = std.fs.File.stdout();
+
+    // Read source file
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        return;
+    };
+    defer allocator.free(source);
+
+    // Use arena for AST
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ast_allocator = arena.allocator();
+
+    // Lex
+    var lex = lexer.Lexer.init(allocator, source);
+    defer lex.deinit();
+
+    const tokens = lex.scanTokens() catch |err| {
+        std.debug.print("Lexer error: {}\n", .{err});
+        return;
+    };
+
+    // Parse
+    var p = parser.Parser.init(ast_allocator, tokens);
+    defer p.deinit();
+
+    const program = p.parse() catch |err| {
+        if (p.getLastError()) |parse_err| {
+            std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ path, parse_err.location.line, parse_err.location.column, parse_err.message });
+        } else {
+            std.debug.print("Parse error: {}\n", .{err});
+        }
+        return;
+    };
+
+    // Generate LLVM IR
+    const llvm_ir = llvm_codegen.compile(allocator, &program) catch |err| {
+        std.debug.print("Code generation error: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(llvm_ir);
+
+    // Output
+    if (output_path) |out_path| {
+        // Write to file
+        const file = std.fs.cwd().createFile(out_path, .{}) catch |err| {
+            std.debug.print("Error creating output file '{s}': {}\n", .{ out_path, err });
+            return;
+        };
+        defer file.close();
+
+        file.writeAll(llvm_ir) catch |err| {
+            std.debug.print("Error writing to '{s}': {}\n", .{ out_path, err });
+            return;
+        };
+
+        std.debug.print("Compiled {s} -> {s} ({d} bytes)\n", .{ path, out_path, llvm_ir.len });
+        std.debug.print("To build: clang {s} -o program -lm\n", .{out_path});
+    } else {
+        // Write to stdout
+        stdout.writeAll(llvm_ir) catch {};
+    }
+}
+
 fn lexFile(allocator: std.mem.Allocator, path: []const u8) !void {
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
         std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
@@ -632,6 +733,11 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
             },
             .load_stmt => |l| {
                 const msg = std.fmt.allocPrint(allocator, "Load: {s} <- {s}\n", .{ l.tensor_name, l.path }) catch continue;
+                defer allocator.free(msg);
+                stdout.writeAll(msg) catch continue;
+            },
+            .backward_stmt => |b| {
+                const msg = std.fmt.allocPrint(allocator, "Backward: {s} wrt {d} params\n", .{ b.loss, b.params.len }) catch continue;
                 defer allocator.free(msg);
                 stdout.writeAll(msg) catch continue;
             },
