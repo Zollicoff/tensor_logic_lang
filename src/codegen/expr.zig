@@ -84,6 +84,17 @@ pub fn genTensorAccess(ctx: *CodegenContext, ref: ast.TensorRef, loop_vars: *std
                     try idx_vals.append(ctx.allocator, try std.fmt.allocPrint(ctx.string_arena.allocator(), "{d}", .{arith.offset}));
                 }
             },
+            .primed => |name| {
+                // Primed index p' - uses a separate loop variable with name "p'"
+                const primed_name = try std.fmt.allocPrint(ctx.string_arena.allocator(), "{s}'", .{name});
+                if (loop_vars.get(primed_name)) |var_name| {
+                    const val = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ val, var_name });
+                    try idx_vals.append(ctx.allocator, val);
+                } else {
+                    try idx_vals.append(ctx.allocator, "0");
+                }
+            },
             else => try idx_vals.append(ctx.allocator, "0"),
         }
     }
@@ -238,6 +249,12 @@ pub fn collectExprIndices(ctx: *CodegenContext, expr_ptr: *const ast.Expr, indic
                         // Arithmetic index like i+1 - collect the base variable
                         const size = ctx.domains.get(arith.base) orelse 10;
                         try indices.put(ctx.allocator, arith.base, size);
+                    },
+                    .primed => |name| {
+                        // Primed index p' - collect as separate variable with same domain size
+                        const size = ctx.domains.get(name) orelse 10;
+                        const primed_name = std.fmt.allocPrint(ctx.string_arena.allocator(), "{s}'", .{name}) catch continue;
+                        try indices.put(ctx.allocator, primed_name, size);
                     },
                     else => {},
                 }

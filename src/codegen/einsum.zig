@@ -27,7 +27,9 @@ pub fn genEinsumLoops(ctx: *CodegenContext, eq: *const ast.Equation, index_vars:
     defer loop_vars.deinit(ctx.allocator);
 
     for (index_vars) |*iv| {
-        const var_name = try std.fmt.allocPrint(ctx.string_arena.allocator(), "%e{d}_{s}", .{ eq_id, iv.name });
+        // Sanitize name for LLVM (replace ' with _prime)
+        const sanitized_name = try sanitizeLLVMName(ctx.string_arena.allocator(), iv.name);
+        const var_name = try std.fmt.allocPrint(ctx.string_arena.allocator(), "%e{d}_{s}", .{ eq_id, sanitized_name });
         try ctx.emitFmt("    {s} = alloca i64\n", .{var_name});
         try loop_vars.put(ctx.allocator, iv.name, var_name);
     }
@@ -74,8 +76,16 @@ pub fn genEinsumLoops(ctx: *CodegenContext, eq: *const ast.Equation, index_vars:
     defer lhs_idx_vals.deinit(ctx.allocator);
 
     for (eq.lhs.indices) |idx| {
-        if (idx == .name) {
-            const var_name = loop_vars.get(idx.name).?;
+        const idx_name: ?[]const u8 = switch (idx) {
+            .name => |n| n,
+            .primed => |n| blk: {
+                const primed_name = std.fmt.allocPrint(ctx.string_arena.allocator(), "{s}'", .{n}) catch null;
+                break :blk primed_name;
+            },
+            else => null,
+        };
+        if (idx_name) |name| {
+            const var_name = loop_vars.get(name) orelse continue;
             const val = try ctx.newTemp();
             try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ val, var_name });
             try lhs_idx_vals.append(ctx.allocator, val);
@@ -188,4 +198,28 @@ pub fn genScalarAssign(ctx: *CodegenContext, eq: *const ast.Equation) !void {
     const ptr = try ctx.newTemp();
     try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ ptr, info.llvm_ptr, offset });
     try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ val, ptr });
+}
+
+/// Sanitize index name for LLVM IR (replace ' with _prime, etc.)
+fn sanitizeLLVMName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    // Check if sanitization needed
+    var needs_sanitize = false;
+    for (name) |c| {
+        if (c == '\'') {
+            needs_sanitize = true;
+            break;
+        }
+    }
+    if (!needs_sanitize) return name;
+
+    // Replace ' with _prime
+    var result = std.ArrayListUnmanaged(u8){};
+    for (name) |c| {
+        if (c == '\'') {
+            try result.appendSlice(allocator, "_prime");
+        } else {
+            try result.append(allocator, c);
+        }
+    }
+    return result.items;
 }

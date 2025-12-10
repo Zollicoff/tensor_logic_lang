@@ -25,6 +25,8 @@ pub fn allocateTensor(ctx: *CodegenContext, name: []const u8, indices: []const a
             const size: usize = switch (idx) {
                 .name => |n| ctx.domains.get(n) orelse 10,
                 .constant => |c| @as(usize, @intCast(c)) + 1,
+                .primed => |n| ctx.domains.get(n) orelse 10, // Primed uses base domain
+                .arithmetic => |a| ctx.domains.get(a.base) orelse 10,
                 else => 10,
             };
             try dims.append(ctx.allocator, size);
@@ -80,6 +82,8 @@ pub fn updateTensorMaxDims(ctx: *CodegenContext, name: []const u8, indices: []co
             const size: usize = switch (idx) {
                 .name => |n| ctx.domains.get(n) orelse 10,
                 .normalize => |n| ctx.domains.get(n) orelse 10,
+                .primed => |n| ctx.domains.get(n) orelse 10,
+                .arithmetic => |a| ctx.domains.get(a.base) orelse 10,
                 .constant => |c| @as(usize, @intCast(c)) + 1,
                 else => 10,
             };
@@ -92,6 +96,8 @@ pub fn updateTensorMaxDims(ctx: *CodegenContext, name: []const u8, indices: []co
             dims[i] = switch (idx) {
                 .name => |n| ctx.domains.get(n) orelse 10,
                 .normalize => |n| ctx.domains.get(n) orelse 10,
+                .primed => |n| ctx.domains.get(n) orelse 10,
+                .arithmetic => |a| ctx.domains.get(a.base) orelse 10,
                 .constant => |c| @as(usize, @intCast(c)) + 1,
                 else => 10,
             };

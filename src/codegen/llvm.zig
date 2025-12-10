@@ -298,17 +298,26 @@ pub const LLVMCodegen = struct {
         var all_indices = std.StringHashMapUnmanaged(usize){};
         defer all_indices.deinit(self.allocator);
 
-        // Collect LHS indices (free indices), including normalize indices
+        // Collect LHS indices (free indices), including normalize and primed indices
         var lhs_indices = std.StringHashMapUnmanaged(void){};
         defer lhs_indices.deinit(self.allocator);
         for (eq.lhs.indices) |idx| {
             const name = switch (idx) {
                 .name => |n| n,
                 .normalize => |n| n,
+                .primed => |n| blk: {
+                    // Primed index p' - create name like "p'"
+                    const primed_name = std.fmt.allocPrint(self.string_arena.allocator(), "{s}'", .{n}) catch continue;
+                    break :blk primed_name;
+                },
                 else => continue,
             };
+            const base_name = switch (idx) {
+                .primed => |n| n,
+                else => name,
+            };
             try lhs_indices.put(self.allocator, name, {});
-            const size = self.domains.get(name) orelse 10;
+            const size = self.domains.get(base_name) orelse 10;
             try all_indices.put(self.allocator, name, size);
         }
 
@@ -327,15 +336,21 @@ pub const LLVMCodegen = struct {
 
         // Free indices first (appear on LHS)
         for (eq.lhs.indices) |idx| {
-            if (idx == .name) {
-                const size = all_indices.get(idx.name) orelse 10;
-                try index_vars.append(self.allocator, .{
-                    .name = idx.name,
-                    .size = size,
-                    .llvm_var = "",
-                    .is_contracted = false,
-                });
-            }
+            const idx_name = switch (idx) {
+                .name => |n| n,
+                .primed => |n| blk: {
+                    const primed_name = std.fmt.allocPrint(self.string_arena.allocator(), "{s}'", .{n}) catch continue;
+                    break :blk primed_name;
+                },
+                else => continue,
+            };
+            const size = all_indices.get(idx_name) orelse 10;
+            try index_vars.append(self.allocator, .{
+                .name = idx_name,
+                .size = size,
+                .llvm_var = "",
+                .is_contracted = false,
+            });
         }
 
         // Contracted indices (on RHS but not LHS)
