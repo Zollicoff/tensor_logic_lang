@@ -179,9 +179,11 @@ pub const Expr = union(enum) {
     },
 
     /// Nonlinearity application: step(x), softmax(x), relu(x)
+    /// Temperature parameter for sigmoid: sigmoid(x, T) where T is temperature
     nonlinearity: struct {
         func: Nonlinearity,
         arg: *Expr,
+        temperature: ?f64 = null, // Optional temperature for sigmoid
     },
 
     /// Embedding lookup: embed(E, x) where E is embedding matrix
@@ -375,7 +377,11 @@ pub const AstBuilder = struct {
     }
 
     pub fn createNonlinearityExpr(self: *AstBuilder, func: Nonlinearity, arg: *Expr) !*Expr {
-        return self.createExpr(.{ .nonlinearity = .{ .func = func, .arg = arg } });
+        return self.createExpr(.{ .nonlinearity = .{ .func = func, .arg = arg, .temperature = null } });
+    }
+
+    pub fn createNonlinearityExprWithTemp(self: *AstBuilder, func: Nonlinearity, arg: *Expr, temp: f64) !*Expr {
+        return self.createExpr(.{ .nonlinearity = .{ .func = func, .arg = arg, .temperature = temp } });
     }
 
     pub fn createProductExpr(self: *AstBuilder, factors: []const *Expr) !*Expr {

@@ -327,6 +327,51 @@ pub const Autodiff = struct {
                     }
                 }
             },
+            .tanh => {
+                // tanh gradient: dL/dX = dL/dY * (1 - Y^2)
+                if (node.inputs.len >= 1) {
+                    const input = node.inputs[0];
+                    if (self.needsGradient(input, params)) {
+                        try self.grad_equations.append(self.allocator, .{
+                            .output = try self.gradName(input),
+                            .rule = .tanh_grad,
+                            .grad_upstream = grad_output,
+                            .operands = try self.allocator.dupe([]const u8, &[_][]const u8{ input, output }),
+                            .original_eq = node.equation,
+                        });
+                    }
+                }
+            },
+            .exp => {
+                // exp gradient: dL/dX = dL/dY * exp(X) = dL/dY * Y
+                if (node.inputs.len >= 1) {
+                    const input = node.inputs[0];
+                    if (self.needsGradient(input, params)) {
+                        try self.grad_equations.append(self.allocator, .{
+                            .output = try self.gradName(input),
+                            .rule = .exp_grad,
+                            .grad_upstream = grad_output,
+                            .operands = try self.allocator.dupe([]const u8, &[_][]const u8{ input, output }),
+                            .original_eq = node.equation,
+                        });
+                    }
+                }
+            },
+            .log => {
+                // log gradient: dL/dX = dL/dY / X
+                if (node.inputs.len >= 1) {
+                    const input = node.inputs[0];
+                    if (self.needsGradient(input, params)) {
+                        try self.grad_equations.append(self.allocator, .{
+                            .output = try self.gradName(input),
+                            .rule = .log_grad,
+                            .grad_upstream = grad_output,
+                            .operands = try self.allocator.dupe([]const u8, &[_][]const u8{input}),
+                            .original_eq = node.equation,
+                        });
+                    }
+                }
+            },
             .identity => {
                 for (node.inputs) |input| {
                     if (self.needsGradient(input, params)) {

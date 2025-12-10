@@ -24,6 +24,7 @@ const fixpoint = @import("fixpoint.zig");
 const autodiff = @import("autodiff.zig");
 const concat = @import("concat.zig");
 const backward = @import("backward.zig");
+const sparse = @import("sparse.zig");
 
 // Re-export types
 pub const TensorInfo = types.TensorInfo;
@@ -52,6 +53,9 @@ pub const LLVMCodegen = struct {
     // Track tensors that use backward chaining (for recursive calls)
     backward_tensors: std.StringHashMapUnmanaged(void),
 
+    // Track sparse tensors (COO format)
+    sparse_tensors: std.StringHashMapUnmanaged(sparse.SparseInfo),
+
     pub fn init(allocator: std.mem.Allocator) LLVMCodegen {
         return .{
             .allocator = allocator,
@@ -64,6 +68,7 @@ pub const LLVMCodegen = struct {
             .domains = .{},
             .tensor_max_dims = .{},
             .backward_tensors = .{},
+            .sparse_tensors = .{},
         };
     }
 
@@ -83,6 +88,7 @@ pub const LLVMCodegen = struct {
         }
         self.tensor_max_dims.deinit(self.allocator);
         self.backward_tensors.deinit(self.allocator);
+        self.sparse_tensors.deinit(self.allocator);
     }
 
     // =========================================================================
@@ -155,6 +161,12 @@ pub const LLVMCodegen = struct {
             \\declare double @llvm.cos.f64(double)
             \\declare double @llvm.pow.f64(double, double)
             \\declare double @llvm.fma.f64(double, double, double)
+            \\
+            \\; File I/O
+            \\declare ptr @fopen(ptr, ptr)
+            \\declare i64 @fwrite(ptr, i64, i64, ptr)
+            \\declare i64 @fread(ptr, i64, i64, ptr)
+            \\declare i32 @fclose(ptr)
             \\
             \\; Format strings
             \\@.str.tensor_start = private constant [12 x i8] c"%s[%zu] = [\00"
@@ -328,6 +340,8 @@ pub const LLVMCodegen = struct {
             .query => |q| try self.genQuery(&q),
             .sparse_decl => |s| try self.genSparseDecl(&s),
             .backward_stmt => |b| try self.genBackward(&b, program),
+            .save_stmt => |s| try self.genSave(&s),
+            .load_stmt => |l| try self.genLoad(&l),
             else => {},
         }
     }
@@ -459,7 +473,30 @@ pub const LLVMCodegen = struct {
     }
 
     fn genSparseDecl(self: *LLVMCodegen, decl: *const ast.SparseDecl) !void {
-        // Treat sparse as dense for now
+        // Use actual sparse COO allocation
+        try self.emitFmt("\n    ; Sparse tensor: {s}\n", .{decl.name});
+
+        // Collect dimension sizes
+        var dims = std.ArrayListUnmanaged(usize){};
+        defer dims.deinit(self.allocator);
+
+        for (decl.indices) |idx| {
+            const domain_name = idx.domain orelse idx.name;
+            const size = self.domains.get(domain_name) orelse 10;
+            try dims.append(self.allocator, size);
+        }
+
+        // Estimate initial capacity (sqrt of total for sparse)
+        var total: usize = 1;
+        for (dims.items) |d| total *= d;
+        const capacity = @max(16, @min(1024, @as(usize, @intFromFloat(@sqrt(@as(f64, @floatFromInt(total)))))));
+
+        // Allocate sparse structure
+        const sparse_info = try sparse.genSparseAlloc(self, decl.name, dims.items.len, dims.items, capacity);
+        try self.sparse_tensors.put(self.allocator, decl.name, sparse_info);
+
+        // Also create a dense view for compatibility (so queries work)
+        // This allows sparse tensors to be queried while maintaining sparse storage
         var indices = std.ArrayListUnmanaged(ast.Index){};
         defer indices.deinit(self.allocator);
 
@@ -469,6 +506,76 @@ pub const LLVMCodegen = struct {
         }
 
         try tensor_mod.allocateTensor(self, decl.name, indices.items);
+    }
+
+    fn genSave(self: *LLVMCodegen, save: *const ast.Save) !void {
+        // Save tensor to binary file: save TensorName "filename"
+        const info = self.tensors.get(save.tensor_name) orelse {
+            try self.emitFmt("    ; Error: tensor '{s}' not found for save\n", .{save.tensor_name});
+            return;
+        };
+
+        try self.emitFmt("\n    ; Save tensor '{s}' to '{s}'\n", .{ save.tensor_name, save.path });
+
+        // Create filename string constant
+        const path_len = save.path.len + 1; // +1 for null terminator
+        const path_name = try std.fmt.allocPrint(self.string_arena.allocator(), "@.save_path.{s}", .{save.tensor_name});
+        try self.emitFmt("    ; Path string: {s}\n", .{save.path});
+
+        // Open file for writing (binary mode)
+        const mode = try self.newTemp();
+        try self.emitFmt("    {s} = alloca [3 x i8]\n", .{mode});
+        try self.emitFmt("    store [3 x i8] c\"wb\\00\", ptr {s}\n", .{mode});
+
+        const path_ptr = try self.newTemp();
+        try self.emitFmt("    {s} = alloca [{d} x i8]\n", .{ path_ptr, path_len });
+        try self.emitFmt("    store [{d} x i8] c\"{s}\\00\", ptr {s}\n", .{ path_len, save.path, path_ptr });
+
+        const file = try self.newTemp();
+        try self.emitFmt("    {s} = call ptr @fopen(ptr {s}, ptr {s})\n", .{ file, path_ptr, mode });
+
+        // Write tensor data
+        const total = info.totalSize();
+        const written = try self.newTemp();
+        try self.emitFmt("    {s} = call i64 @fwrite(ptr {s}, i64 8, i64 {d}, ptr {s})\n", .{ written, info.llvm_ptr, total, file });
+
+        // Close file
+        const close_ret = try self.newTemp();
+        try self.emitFmt("    {s} = call i32 @fclose(ptr {s})\n", .{ close_ret, file });
+        _ = path_name;
+    }
+
+    fn genLoad(self: *LLVMCodegen, load: *const ast.Load) !void {
+        // Load tensor from binary file: load TensorName "filename"
+        const info = self.tensors.get(load.tensor_name) orelse {
+            try self.emitFmt("    ; Error: tensor '{s}' not found for load\n", .{load.tensor_name});
+            return;
+        };
+
+        try self.emitFmt("\n    ; Load tensor '{s}' from '{s}'\n", .{ load.tensor_name, load.path });
+
+        const path_len = load.path.len + 1;
+
+        // Open file for reading (binary mode)
+        const mode = try self.newTemp();
+        try self.emitFmt("    {s} = alloca [3 x i8]\n", .{mode});
+        try self.emitFmt("    store [3 x i8] c\"rb\\00\", ptr {s}\n", .{mode});
+
+        const path_ptr = try self.newTemp();
+        try self.emitFmt("    {s} = alloca [{d} x i8]\n", .{ path_ptr, path_len });
+        try self.emitFmt("    store [{d} x i8] c\"{s}\\00\", ptr {s}\n", .{ path_len, load.path, path_ptr });
+
+        const file = try self.newTemp();
+        try self.emitFmt("    {s} = call ptr @fopen(ptr {s}, ptr {s})\n", .{ file, path_ptr, mode });
+
+        // Read tensor data
+        const total = info.totalSize();
+        const read_count = try self.newTemp();
+        try self.emitFmt("    {s} = call i64 @fread(ptr {s}, i64 8, i64 {d}, ptr {s})\n", .{ read_count, info.llvm_ptr, total, file });
+
+        // Close file
+        const close_ret = try self.newTemp();
+        try self.emitFmt("    {s} = call i32 @fclose(ptr {s})\n", .{ close_ret, file });
     }
 
     fn genBackward(self: *LLVMCodegen, back_stmt: *const ast.Backward, program: *const ast.Program) !void {
@@ -580,6 +687,22 @@ pub const LLVMCodegen = struct {
                 // dL/dB += A^T * dL/dC
                 try self.genGradMatmulRight(grad_eq);
             },
+            .tanh_grad => {
+                // dL/dX += dL/dY * (1 - Y^2)
+                try self.genGradTanh(grad_eq);
+            },
+            .exp_grad => {
+                // dL/dX += dL/dY * Y (since Y = exp(X))
+                try self.genGradExp(grad_eq);
+            },
+            .log_grad => {
+                // dL/dX += dL/dY / X
+                try self.genGradLog(grad_eq);
+            },
+            .softmax_grad => {
+                // dL/dX[i] += Y[i] * (dL/dY[i] - sum_j(dL/dY[j] * Y[j]))
+                try self.genGradSoftmax(grad_eq);
+            },
             else => {
                 try self.emitFmt("    ; TODO: gradient rule {s}\n", .{@tagName(grad_eq.rule)});
             },
@@ -678,6 +801,189 @@ pub const LLVMCodegen = struct {
             // Multiply: dL/dY * derivative
             const grad = try self.newTemp();
             try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, deriv });
+
+            // Accumulate
+            const out_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+            const old_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+            const new_val = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+        }
+    }
+
+    fn genGradTanh(self: *LLVMCodegen, grad_eq: *const autodiff.GradEquation) !void {
+        // dL/dX += dL/dY * (1 - Y^2)
+        const upstream_info = self.tensors.get(grad_eq.grad_upstream) orelse return;
+        const output_info = self.tensors.get(grad_eq.output) orelse return;
+        const tanh_output_info = self.tensors.get(grad_eq.operands[1]) orelse return;
+
+        const total = upstream_info.totalSize();
+        for (0..total) |i| {
+            // Load upstream gradient
+            const up_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+            const up_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+            // Load tanh output Y
+            const y_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, tanh_output_info.llvm_ptr, i });
+            const y_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+            // Compute (1 - Y^2)
+            const y_sq = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ y_sq, y_val, y_val });
+            const deriv = try self.newTemp();
+            try self.emitFmt("    {s} = fsub double 1.0, {s}\n", .{ deriv, y_sq });
+
+            // Multiply: dL/dY * derivative
+            const grad = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, deriv });
+
+            // Accumulate
+            const out_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+            const old_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+            const new_val = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+        }
+    }
+
+    fn genGradExp(self: *LLVMCodegen, grad_eq: *const autodiff.GradEquation) !void {
+        // dL/dX += dL/dY * Y (since Y = exp(X), derivative is Y itself)
+        const upstream_info = self.tensors.get(grad_eq.grad_upstream) orelse return;
+        const output_info = self.tensors.get(grad_eq.output) orelse return;
+        const exp_output_info = self.tensors.get(grad_eq.operands[1]) orelse return;
+
+        const total = upstream_info.totalSize();
+        for (0..total) |i| {
+            // Load upstream gradient
+            const up_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+            const up_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+            // Load exp output Y
+            const y_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, exp_output_info.llvm_ptr, i });
+            const y_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+            // Multiply: dL/dY * Y
+            const grad = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, y_val });
+
+            // Accumulate
+            const out_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+            const old_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+            const new_val = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+        }
+    }
+
+    fn genGradLog(self: *LLVMCodegen, grad_eq: *const autodiff.GradEquation) !void {
+        // dL/dX += dL/dY / X
+        const upstream_info = self.tensors.get(grad_eq.grad_upstream) orelse return;
+        const output_info = self.tensors.get(grad_eq.output) orelse return;
+        const input_info = self.tensors.get(grad_eq.operands[0]) orelse return;
+
+        const total = upstream_info.totalSize();
+        for (0..total) |i| {
+            // Load upstream gradient
+            const up_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+            const up_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+            // Load input X
+            const x_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ x_ptr, input_info.llvm_ptr, i });
+            const x_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ x_val, x_ptr });
+
+            // Compute dL/dY / X
+            const grad = try self.newTemp();
+            try self.emitFmt("    {s} = fdiv double {s}, {s}\n", .{ grad, up_val, x_val });
+
+            // Accumulate
+            const out_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+            const old_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+            const new_val = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+        }
+    }
+
+    fn genGradSoftmax(self: *LLVMCodegen, grad_eq: *const autodiff.GradEquation) !void {
+        // Softmax gradient: dL/dX[i] = Y[i] * (dL/dY[i] - sum_j(dL/dY[j] * Y[j]))
+        // This is the efficient form: instead of computing full Jacobian
+        const upstream_info = self.tensors.get(grad_eq.grad_upstream) orelse return;
+        const output_info = self.tensors.get(grad_eq.output) orelse return;
+        const softmax_output_info = self.tensors.get(grad_eq.operands[1]) orelse return;
+
+        const total = upstream_info.totalSize();
+
+        // First compute sum_j(dL/dY[j] * Y[j])
+        const dot_sum = try self.newTemp();
+        try self.emitFmt("    {s} = alloca double\n", .{dot_sum});
+        try self.emitFmt("    store double 0.0, ptr {s}\n", .{dot_sum});
+
+        for (0..total) |i| {
+            const up_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+            const up_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+            const y_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, softmax_output_info.llvm_ptr, i });
+            const y_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+            const prod = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ prod, up_val, y_val });
+
+            const old_sum = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ old_sum, dot_sum });
+            const new_sum = try self.newTemp();
+            try self.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_sum, old_sum, prod });
+            try self.emitFmt("    store double {s}, ptr {s}\n", .{ new_sum, dot_sum });
+        }
+
+        // Load the computed sum
+        const sum_val = try self.newTemp();
+        try self.emitFmt("    {s} = load double, ptr {s}\n", .{ sum_val, dot_sum });
+
+        // Now compute gradient for each element
+        for (0..total) |i| {
+            // Load dL/dY[i]
+            const up_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+            const up_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+            // Load Y[i]
+            const y_ptr = try self.newTemp();
+            try self.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, softmax_output_info.llvm_ptr, i });
+            const y_val = try self.newTemp();
+            try self.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+            // Compute (dL/dY[i] - sum)
+            const diff = try self.newTemp();
+            try self.emitFmt("    {s} = fsub double {s}, {s}\n", .{ diff, up_val, sum_val });
+
+            // Multiply by Y[i]
+            const grad = try self.newTemp();
+            try self.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, y_val, diff });
 
             // Accumulate
             const out_ptr = try self.newTemp();

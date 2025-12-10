@@ -590,13 +590,37 @@ pub const Parser = struct {
             return cond_expr;
         }
 
-        // Nonlinearity function: step(x), relu(x), etc.
+        // Nonlinearity function: step(x), relu(x), sigmoid(x, T), etc.
         if (self.matchNonlinearity()) |func| {
             if (!self.match(.lparen)) {
                 self.recordError("expected '(' after function name");
                 return ParseError.ExpectedExpression;
             }
             const arg = try self.parseExpr();
+
+            // Check for optional temperature parameter (sigmoid only)
+            if (func == .sigmoid and self.match(.comma)) {
+                // Parse temperature value
+                if (self.check(.float)) {
+                    const temp_tok = self.advance();
+                    const temp = std.fmt.parseFloat(f64, temp_tok.lexeme) catch 1.0;
+                    if (!self.match(.rparen)) {
+                        self.recordError("expected ')' after temperature parameter");
+                        return ParseError.ExpectedClosingParen;
+                    }
+                    return self.builder.createNonlinearityExprWithTemp(func, arg, temp) catch return ParseError.OutOfMemory;
+                } else if (self.check(.integer)) {
+                    const temp_tok = self.advance();
+                    const temp_int = std.fmt.parseInt(i64, temp_tok.lexeme, 10) catch 1;
+                    const temp: f64 = @floatFromInt(temp_int);
+                    if (!self.match(.rparen)) {
+                        self.recordError("expected ')' after temperature parameter");
+                        return ParseError.ExpectedClosingParen;
+                    }
+                    return self.builder.createNonlinearityExprWithTemp(func, arg, temp) catch return ParseError.OutOfMemory;
+                }
+            }
+
             if (!self.match(.rparen)) {
                 self.recordError("expected ')' after function argument");
                 return ParseError.ExpectedClosingParen;

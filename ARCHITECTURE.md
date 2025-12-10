@@ -93,19 +93,16 @@ src/
 - All nonlinearities: step, relu, sigmoid, tanh, softmax, lnorm, exp, log, sqrt, abs, sin, cos
 - Accumulation operators: `=`, `+=`, `max=`, `min=`, `*=`, `avg=`
 - Division indices `X/2` for pooling
+- Slice indices `X[4:8]` for subranges
 - Concat for attention head merging
 - Forward chaining with fixpoint iteration
 - **Backward chaining with memoization** (recursive functions for query-driven inference)
-- Partial autodiff (2D matmul, relu, sigmoid gradients)
+- **Full autodiff**: tanh, exp, log, softmax gradients
+- **Temperature sigmoid**: `sigmoid(x, T)` for embedding space reasoning
+- **Sparse tensor support** (COO format allocation)
+- **File I/O**: `save`/`load` for tensor persistence
 - Virtual indices `*t`, primed indices `p'`, index arithmetic `i+1`
 - VS Code extension with LSP
-
-### In Progress 🔧
-- **Full autodiff**: Complete gradient rules for all operations
-- **Sparse codegen**: Integrate existing sparse.zig (currently falls back to dense)
-- **Slice indices**: `X[4:8]` - parser done, codegen needed
-- **Temperature sigmoid**: `σ(x, T)` for embedding space reasoning
-- **File I/O**: `save`/`load` syntax parsed, codegen needed
 
 ### Planned 📋
 - Tucker decomposition for scaling sparse→dense
@@ -119,9 +116,9 @@ src/
 | Einstein summation | ✅ | einsum.zig |
 | Forward chaining | ✅ | loops + fixpoint |
 | Backward chaining | ✅ | recursive functions + memoization |
-| Autodiff | 🔧 | autodiff.zig (partial) |
-| Sparse tensors | 🔧 | sparse.zig (not integrated) |
-| Temperature σ(x,T) | 📋 | For embedding reasoning |
+| Autodiff | ✅ | autodiff.zig (full) |
+| Sparse tensors | ✅ | sparse.zig (COO format) |
+| Temperature σ(x,T) | ✅ | sigmoid(x, T) for embedding reasoning |
 | Tucker decomposition | 📋 | Scaling strategy |
 
 ## CLI

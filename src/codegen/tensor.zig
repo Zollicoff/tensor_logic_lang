@@ -33,6 +33,10 @@ pub fn allocateTensor(ctx: *CodegenContext, name: []const u8, indices: []const a
                     const divisor: usize = @intCast(d.divisor);
                     break :blk (base_size + divisor - 1) / divisor;
                 },
+                .slice => |s| blk: {
+                    // Slice 4:8 - size is end - start
+                    break :blk if (s.end > s.start) @as(usize, @intCast(s.end - s.start)) else 1;
+                },
                 else => 10,
             };
             try dims.append(ctx.allocator, size);
@@ -96,6 +100,7 @@ pub fn updateTensorMaxDims(ctx: *CodegenContext, name: []const u8, indices: []co
                     const divisor: usize = @intCast(d.divisor);
                     break :blk (base_size + divisor - 1) / divisor;
                 },
+                .slice => |s| if (s.end > s.start) @as(usize, @intCast(s.end - s.start)) else 1,
                 else => 10,
             };
             existing[i] = @max(existing[i], size);
@@ -115,6 +120,7 @@ pub fn updateTensorMaxDims(ctx: *CodegenContext, name: []const u8, indices: []co
                     const divisor: usize = @intCast(d.divisor);
                     break :blk (base_size + divisor - 1) / divisor;
                 },
+                .slice => |s| if (s.end > s.start) @as(usize, @intCast(s.end - s.start)) else 1,
                 else => 10,
             };
         }
@@ -169,6 +175,7 @@ pub fn allocateTensorGlobal(ctx: *CodegenContext, name: []const u8, indices: []c
                     const divisor: usize = @intCast(d.divisor);
                     break :blk (base_size + divisor - 1) / divisor;
                 },
+                .slice => |s| if (s.end > s.start) @as(usize, @intCast(s.end - s.start)) else 1,
                 else => 10,
             };
             try dims.append(ctx.allocator, size);

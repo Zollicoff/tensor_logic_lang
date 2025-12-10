@@ -139,6 +139,11 @@ pub fn genTensorAccess(ctx: *CodegenContext, ref: ast.TensorRef, loop_vars: *std
                     try idx_vals.append(ctx.allocator, "0");
                 }
             },
+            .slice => |s| {
+                // For slice access, we need a loop variable - for now just use start
+                // TODO: Full slice support would need loop bounds adjustment
+                try idx_vals.append(ctx.allocator, try std.fmt.allocPrint(ctx.string_arena.allocator(), "{d}", .{s.start}));
+            },
             else => try idx_vals.append(ctx.allocator, "0"),
         }
     }
@@ -243,10 +248,25 @@ pub fn genNonlinearity(ctx: *CodegenContext, nl: anytype, loop_vars: *std.String
             try ctx.emitFmt("    {s} = select i1 {s}, double {s}, double 0.0\n", .{ result, cmp, arg });
         },
         .sigmoid => {
-            const neg = try ctx.newTemp();
-            try ctx.emitFmt("    {s} = fneg double {s}\n", .{ neg, arg });
+            // Temperature sigmoid: σ(x, T) = 1 / (1 + exp(-x/T))
+            // If T is null, defaults to standard sigmoid (T=1)
+            const scaled_neg = blk: {
+                if (nl.temperature) |temp| {
+                    // With temperature: compute -x/T
+                    const scaled = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = fdiv double {s}, {e}\n", .{ scaled, arg, temp });
+                    const neg = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = fneg double {s}\n", .{ neg, scaled });
+                    break :blk neg;
+                } else {
+                    // Standard sigmoid: -x
+                    const neg = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = fneg double {s}\n", .{ neg, arg });
+                    break :blk neg;
+                }
+            };
             const exp_val = try ctx.newTemp();
-            try ctx.emitFmt("    {s} = call double @llvm.exp.f64(double {s})\n", .{ exp_val, neg });
+            try ctx.emitFmt("    {s} = call double @llvm.exp.f64(double {s})\n", .{ exp_val, scaled_neg });
             const denom = try ctx.newTemp();
             try ctx.emitFmt("    {s} = fadd double 1.0, {s}\n", .{ denom, exp_val });
             try ctx.emitFmt("    {s} = fdiv double 1.0, {s}\n", .{ result, denom });
@@ -304,6 +324,13 @@ pub fn collectExprIndices(ctx: *CodegenContext, expr_ptr: *const ast.Expr, indic
                         // Division index i/S - collect the base variable with full domain size
                         const size = ctx.domains.get(div_info.index) orelse 10;
                         try indices.put(ctx.allocator, div_info.index, size);
+                    },
+                    .slice => |s| {
+                        // Slice 4:8 - creates anonymous index with range size
+                        // Use position-based name (s_0, s_1, etc.)
+                        const slice_size = if (s.end > s.start) s.end - s.start else 1;
+                        const slice_name = std.fmt.allocPrint(ctx.string_arena.allocator(), "_slice_{d}_{d}", .{ s.start, s.end }) catch continue;
+                        try indices.put(ctx.allocator, slice_name, @intCast(slice_size));
                     },
                     else => {},
                 }
