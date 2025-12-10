@@ -69,6 +69,21 @@ pub fn genTensorAccess(ctx: *CodegenContext, ref: ast.TensorRef, loop_vars: *std
             .constant => |c| {
                 try idx_vals.append(ctx.allocator, try std.fmt.allocPrint(ctx.string_arena.allocator(), "{d}", .{c}));
             },
+            .arithmetic => |arith| {
+                // Handle i+1, i-1, etc.
+                if (loop_vars.get(arith.base)) |var_name| {
+                    const base_val = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ base_val, var_name });
+                    const result_val = try ctx.newTemp();
+                    switch (arith.op) {
+                        .add => try ctx.emitFmt("    {s} = add i64 {s}, {d}\n", .{ result_val, base_val, arith.offset }),
+                        .sub => try ctx.emitFmt("    {s} = sub i64 {s}, {d}\n", .{ result_val, base_val, arith.offset }),
+                    }
+                    try idx_vals.append(ctx.allocator, result_val);
+                } else {
+                    try idx_vals.append(ctx.allocator, try std.fmt.allocPrint(ctx.string_arena.allocator(), "{d}", .{arith.offset}));
+                }
+            },
             else => try idx_vals.append(ctx.allocator, "0"),
         }
     }
@@ -210,13 +225,21 @@ pub fn genNonlinearity(ctx: *CodegenContext, nl: anytype, loop_vars: *std.String
 }
 
 /// Collect all named indices from an expression
-pub fn collectExprIndices(ctx: *CodegenContext, expr: *const ast.Expr, indices: *std.StringHashMapUnmanaged(usize)) !void {
-    switch (expr.*) {
+pub fn collectExprIndices(ctx: *CodegenContext, expr_ptr: *const ast.Expr, indices: *std.StringHashMapUnmanaged(usize)) !void {
+    switch (expr_ptr.*) {
         .tensor_ref => |ref| {
             for (ref.indices) |idx| {
-                if (idx == .name) {
-                    const size = ctx.domains.get(idx.name) orelse 10;
-                    try indices.put(ctx.allocator, idx.name, size);
+                switch (idx) {
+                    .name => |name| {
+                        const size = ctx.domains.get(name) orelse 10;
+                        try indices.put(ctx.allocator, name, size);
+                    },
+                    .arithmetic => |arith| {
+                        // Arithmetic index like i+1 - collect the base variable
+                        const size = ctx.domains.get(arith.base) orelse 10;
+                        try indices.put(ctx.allocator, arith.base, size);
+                    },
+                    else => {},
                 }
             }
         },

@@ -90,4 +90,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_ast_opt_tests = b.addRunArtifact(ast_opt_tests);
     test_step.dependOn(&run_ast_opt_tests.step);
+
+    // Integration tests (requires tlc to be built first)
+    const integration_exe = b.addExecutable(.{
+        .name = "integration_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_integration = b.addRunArtifact(integration_exe);
+    run_integration.step.dependOn(b.getInstallStep()); // Depends on tlc being built
+    const integration_step = b.step("integration", "Run integration tests");
+    integration_step.dependOn(&run_integration.step);
 }

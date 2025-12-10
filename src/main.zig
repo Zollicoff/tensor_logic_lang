@@ -69,6 +69,31 @@ pub fn main() !void {
         } else {
             std.debug.print("Error: 'compile' command requires a file path\n", .{});
         }
+    } else if (std.mem.eql(u8, command, "build")) {
+        if (args.len < 3) {
+            std.debug.print("Error: 'build' command requires a file path\n", .{});
+            return;
+        }
+        // Parse build flags: -o <output>
+        var output_path: ?[]const u8 = null;
+        var file_path: ?[]const u8 = null;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+                i += 1;
+                if (i < args.len) {
+                    output_path = args[i];
+                }
+            } else if (file_path == null) {
+                file_path = arg;
+            }
+        }
+        if (file_path) |path| {
+            try buildFile(allocator, path, output_path);
+        } else {
+            std.debug.print("Error: 'build' command requires a file path\n", .{});
+        }
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
@@ -90,23 +115,19 @@ fn printUsage() !void {
         \\Usage: tlc <command> [options] [file]
         \\
         \\Commands:
-        \\  compile <file>       Compile to LLVM IR (default command)
+        \\  build <file> -o out  Build native executable (requires clang)
+        \\  compile <file>       Compile to LLVM IR (stdout)
         \\  compile <file> -o f  Compile and write LLVM IR to file
         \\  check <file>         Type check a .tl file
-        \\  lex <file>           Tokenize a .tl file and print tokens
-        \\  parse <file>         Parse a .tl file and print AST summary
+        \\  lex <file>           Tokenize a .tl file
+        \\  parse <file>         Parse a .tl file
         \\  help                 Show this help message
         \\  version              Show version information
         \\
-        \\Compile Options:
-        \\  -o, --output <file>  Write LLVM IR to file (default: stdout)
-        \\  --emit-llvm          Emit LLVM IR (default)
-        \\
         \\Examples:
+        \\  tlc build examples/matmul.tl -o matmul && ./matmul
         \\  tlc compile examples/matmul.tl -o matmul.ll
-        \\  clang matmul.ll -o matmul -lm && ./matmul
         \\  tlc check examples/ancestor.tl
-        \\  tlc examples/mlp.tl              # shorthand for compile
         \\
     );
 }
@@ -114,6 +135,107 @@ fn printUsage() !void {
 fn printVersion() !void {
     const stdout = std.fs.File.stdout();
     try stdout.writeAll("tlc version 0.1.0\n");
+}
+
+fn buildFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]const u8) !void {
+    // Read source file
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        return;
+    };
+    defer allocator.free(source);
+
+    // Use arena for AST
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const ast_allocator = arena.allocator();
+
+    // Lex
+    var lex = lexer.Lexer.init(allocator, source);
+    defer lex.deinit();
+
+    const tokens = lex.scanTokens() catch |err| {
+        std.debug.print("Lexer error: {}\n", .{err});
+        return;
+    };
+
+    // Parse
+    var p = parser.Parser.init(ast_allocator, tokens);
+    defer p.deinit();
+
+    const program = p.parse() catch |err| {
+        if (p.getLastError()) |parse_err| {
+            std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ path, parse_err.location.line, parse_err.location.column, parse_err.message });
+        } else {
+            std.debug.print("Parse error: {}\n", .{err});
+        }
+        return;
+    };
+
+    // Generate LLVM IR
+    const llvm_ir = llvm_codegen.compile(allocator, &program) catch |err| {
+        std.debug.print("Code generation error: {}\n", .{err});
+        return;
+    };
+    defer allocator.free(llvm_ir);
+
+    // Determine output name
+    const out_name = output_path orelse blk: {
+        // Strip .tl extension if present, otherwise use "a.out"
+        if (std.mem.endsWith(u8, path, ".tl")) {
+            break :blk path[0 .. path.len - 3];
+        }
+        break :blk "a.out";
+    };
+
+    // Write LLVM IR to temp file
+    const tmp_ll = std.fmt.allocPrint(allocator, "/tmp/tlc_{d}.ll", .{std.time.milliTimestamp()}) catch {
+        std.debug.print("Error: out of memory\n", .{});
+        return;
+    };
+    defer allocator.free(tmp_ll);
+
+    const tmp_file = std.fs.createFileAbsolute(tmp_ll, .{}) catch |err| {
+        std.debug.print("Error creating temp file: {}\n", .{err});
+        return;
+    };
+    tmp_file.writeAll(llvm_ir) catch |err| {
+        std.debug.print("Error writing temp file: {}\n", .{err});
+        tmp_file.close();
+        return;
+    };
+    tmp_file.close();
+
+    // Invoke clang
+    var child = std.process.Child.init(&[_][]const u8{
+        "clang",
+        tmp_ll,
+        "-o",
+        out_name,
+        "-lm",
+    }, allocator);
+
+    child.spawn() catch |err| {
+        std.debug.print("Error: failed to run clang: {}\n", .{err});
+        std.debug.print("Make sure clang is installed and in your PATH\n", .{});
+        std.fs.deleteFileAbsolute(tmp_ll) catch {};
+        return;
+    };
+
+    const result = child.wait() catch |err| {
+        std.debug.print("Error waiting for clang: {}\n", .{err});
+        std.fs.deleteFileAbsolute(tmp_ll) catch {};
+        return;
+    };
+
+    // Clean up temp file
+    std.fs.deleteFileAbsolute(tmp_ll) catch {};
+
+    if (result.Exited == 0) {
+        std.debug.print("Built {s} -> {s}\n", .{ path, out_name });
+    } else {
+        std.debug.print("Error: clang failed with exit code {}\n", .{result.Exited});
+    }
 }
 
 fn compileFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]const u8) !void {
