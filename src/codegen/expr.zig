@@ -95,6 +95,38 @@ pub fn genTensorAccess(ctx: *CodegenContext, ref: ast.TensorRef, loop_vars: *std
                     try idx_vals.append(ctx.allocator, "0");
                 }
             },
+            .virtual => |tensor_name| {
+                // Virtual index *t - use tensor t's value as index (gather operation)
+                // First, we need to know the current loop position to index into t
+                // The virtual tensor should be 1D and we use the "current" loop variable
+                if (ctx.tensors.get(tensor_name)) |virt_info| {
+                    // Find the first available loop variable to use as position
+                    var pos_var: ?[]const u8 = null;
+                    var loop_iter = loop_vars.iterator();
+                    while (loop_iter.next()) |entry| {
+                        pos_var = entry.value_ptr.*;
+                        break;
+                    }
+                    if (pos_var) |pv| {
+                        // Load position from loop var
+                        const pos = try ctx.newTemp();
+                        try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ pos, pv });
+                        // Load value from virtual tensor at position
+                        const virt_ptr = try ctx.newTemp();
+                        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ virt_ptr, virt_info.llvm_ptr, pos });
+                        const virt_val = try ctx.newTemp();
+                        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ virt_val, virt_ptr });
+                        // Convert to integer index
+                        const idx_int = try ctx.newTemp();
+                        try ctx.emitFmt("    {s} = fptosi double {s} to i64\n", .{ idx_int, virt_val });
+                        try idx_vals.append(ctx.allocator, idx_int);
+                    } else {
+                        try idx_vals.append(ctx.allocator, "0");
+                    }
+                } else {
+                    try idx_vals.append(ctx.allocator, "0");
+                }
+            },
             else => try idx_vals.append(ctx.allocator, "0"),
         }
     }
