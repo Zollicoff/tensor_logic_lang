@@ -22,6 +22,7 @@ const softmax = @import("softmax.zig");
 const layernorm = @import("layernorm.zig");
 const fixpoint = @import("fixpoint.zig");
 const autodiff = @import("autodiff.zig");
+const concat = @import("concat.zig");
 
 // Re-export types
 pub const TensorInfo = types.TensorInfo;
@@ -276,7 +277,7 @@ pub const LLVMCodegen = struct {
     fn genEquation(self: *LLVMCodegen, eq: *const ast.Equation) !void {
         try self.emitFmt("\n    ; Equation: {s}[...] = ...\n", .{eq.lhs.name});
 
-        // Check if this is a softmax or layer norm operation
+        // Check if this is a softmax, layer norm, or concat operation
         if (eq.rhs.* == .nonlinearity) {
             const nl = eq.rhs.nonlinearity;
             if (nl.func == .softmax) {
@@ -285,6 +286,10 @@ pub const LLVMCodegen = struct {
             }
             if (nl.func == .lnorm) {
                 try layernorm.genLayerNorm(self, eq);
+                return;
+            }
+            if (nl.func == .concat) {
+                try concat.genConcat(self, eq);
                 return;
             }
         }
@@ -298,7 +303,7 @@ pub const LLVMCodegen = struct {
         var all_indices = std.StringHashMapUnmanaged(usize){};
         defer all_indices.deinit(self.allocator);
 
-        // Collect LHS indices (free indices), including normalize and primed indices
+        // Collect LHS indices (free indices), including normalize, primed, and div indices
         var lhs_indices = std.StringHashMapUnmanaged(void){};
         defer lhs_indices.deinit(self.allocator);
         for (eq.lhs.indices) |idx| {
@@ -310,10 +315,12 @@ pub const LLVMCodegen = struct {
                     const primed_name = std.fmt.allocPrint(self.string_arena.allocator(), "{s}'", .{n}) catch continue;
                     break :blk primed_name;
                 },
+                .div => |d| d.index, // Division index X/2 uses base index X
                 else => continue,
             };
             const base_name = switch (idx) {
                 .primed => |n| n,
+                .div => |d| d.index,
                 else => name,
             };
             try lhs_indices.put(self.allocator, name, {});
@@ -342,6 +349,7 @@ pub const LLVMCodegen = struct {
                     const primed_name = std.fmt.allocPrint(self.string_arena.allocator(), "{s}'", .{n}) catch continue;
                     break :blk primed_name;
                 },
+                .div => |d| d.index, // Division index X/2 - loop variable is X
                 else => continue,
             };
             const size = all_indices.get(idx_name) orelse 10;

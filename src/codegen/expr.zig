@@ -127,6 +127,18 @@ pub fn genTensorAccess(ctx: *CodegenContext, ref: ast.TensorRef, loop_vars: *std
                     try idx_vals.append(ctx.allocator, "0");
                 }
             },
+            .div => |div_info| {
+                // Division index i/S - for pooling/striding operations
+                if (loop_vars.get(div_info.index)) |var_name| {
+                    const base_val = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ base_val, var_name });
+                    const result_val = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = sdiv i64 {s}, {d}\n", .{ result_val, base_val, div_info.divisor });
+                    try idx_vals.append(ctx.allocator, result_val);
+                } else {
+                    try idx_vals.append(ctx.allocator, "0");
+                }
+            },
             else => try idx_vals.append(ctx.allocator, "0"),
         }
     }
@@ -287,6 +299,11 @@ pub fn collectExprIndices(ctx: *CodegenContext, expr_ptr: *const ast.Expr, indic
                         const size = ctx.domains.get(name) orelse 10;
                         const primed_name = std.fmt.allocPrint(ctx.string_arena.allocator(), "{s}'", .{name}) catch continue;
                         try indices.put(ctx.allocator, primed_name, size);
+                    },
+                    .div => |div_info| {
+                        // Division index i/S - collect the base variable with full domain size
+                        const size = ctx.domains.get(div_info.index) orelse 10;
+                        try indices.put(ctx.allocator, div_info.index, size);
                     },
                     else => {},
                 }

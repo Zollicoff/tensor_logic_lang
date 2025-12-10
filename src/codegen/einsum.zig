@@ -22,6 +22,19 @@ pub fn genEinsumLoops(ctx: *CodegenContext, eq: *const ast.Equation, index_vars:
     const eq_id = ctx.equation_counter;
     ctx.equation_counter += 1;
 
+    // Compute pooling factor for avg= operator (product of LHS division indices)
+    var avg_divisor: i64 = 1;
+    if (eq.op == .avg) {
+        for (eq.lhs.indices) |idx| {
+            switch (idx) {
+                .div => |d| {
+                    avg_divisor *= d.divisor;
+                },
+                else => {},
+            }
+        }
+    }
+
     // Allocate loop variables (with unique prefix per equation)
     var loop_vars = std.StringHashMapUnmanaged([]const u8){};
     defer loop_vars.deinit(ctx.allocator);
@@ -76,19 +89,32 @@ pub fn genEinsumLoops(ctx: *CodegenContext, eq: *const ast.Equation, index_vars:
     defer lhs_idx_vals.deinit(ctx.allocator);
 
     for (eq.lhs.indices) |idx| {
-        const idx_name: ?[]const u8 = switch (idx) {
-            .name => |n| n,
-            .primed => |n| blk: {
-                const primed_name = std.fmt.allocPrint(ctx.string_arena.allocator(), "{s}'", .{n}) catch null;
-                break :blk primed_name;
+        switch (idx) {
+            .name => |n| {
+                const var_name = loop_vars.get(n) orelse continue;
+                const val = try ctx.newTemp();
+                try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ val, var_name });
+                try lhs_idx_vals.append(ctx.allocator, val);
             },
-            else => null,
-        };
-        if (idx_name) |name| {
-            const var_name = loop_vars.get(name) orelse continue;
-            const val = try ctx.newTemp();
-            try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ val, var_name });
-            try lhs_idx_vals.append(ctx.allocator, val);
+            .primed => |n| {
+                const primed_name = std.fmt.allocPrint(ctx.string_arena.allocator(), "{s}'", .{n}) catch null;
+                if (primed_name) |name| {
+                    const var_name = loop_vars.get(name) orelse continue;
+                    const val = try ctx.newTemp();
+                    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ val, var_name });
+                    try lhs_idx_vals.append(ctx.allocator, val);
+                }
+            },
+            .div => |d| {
+                // Division index on LHS: load base index and divide
+                const var_name = loop_vars.get(d.index) orelse continue;
+                const base_val = try ctx.newTemp();
+                try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ base_val, var_name });
+                const div_val = try ctx.newTemp();
+                try ctx.emitFmt("    {s} = sdiv i64 {s}, {d}\n", .{ div_val, base_val, d.divisor });
+                try lhs_idx_vals.append(ctx.allocator, div_val);
+            },
+            else => {},
         }
     }
 
@@ -120,6 +146,52 @@ pub fn genEinsumLoops(ctx: *CodegenContext, eq: *const ast.Equation, index_vars:
 
         // Loop end
         try ctx.emitFmt("{s}:\n", .{labels.end});
+    }
+
+    // For avg= operator: divide all LHS elements by the pooling factor
+    if (eq.op == .avg and avg_divisor > 1) {
+        try ctx.emit("    ; Normalize for avg= operator\n");
+
+        // Compute total size of LHS tensor
+        var total_size: usize = 1;
+        for (lhs_info.dims) |d| {
+            total_size *= d;
+        }
+
+        // Generate loop to divide each element
+        const avg_idx_var = try std.fmt.allocPrint(ctx.string_arena.allocator(), "%avg_idx_{d}", .{eq_id});
+        try ctx.emitFmt("    {s} = alloca i64\n", .{avg_idx_var});
+        try ctx.emitFmt("    store i64 0, ptr {s}\n", .{avg_idx_var});
+
+        const avg_start = try ctx.newLabel();
+        const avg_body = try ctx.newLabel();
+        const avg_end = try ctx.newLabel();
+
+        try ctx.emitFmt("    br label %{s}\n", .{avg_start});
+        try ctx.emitFmt("{s}:\n", .{avg_start});
+
+        const avg_idx = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ avg_idx, avg_idx_var });
+        const avg_cmp = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ avg_cmp, avg_idx, total_size });
+        try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ avg_cmp, avg_body, avg_end });
+        try ctx.emitFmt("{s}:\n", .{avg_body});
+
+        // Load, divide, store
+        const elem_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ elem_ptr, lhs_info.llvm_ptr, avg_idx });
+        const elem_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ elem_val, elem_ptr });
+        const div_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fdiv double {s}, {d}.0\n", .{ div_val, elem_val, avg_divisor });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ div_val, elem_ptr });
+
+        // Increment and loop
+        const next_avg_idx = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ next_avg_idx, avg_idx });
+        try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ next_avg_idx, avg_idx_var });
+        try ctx.emitFmt("    br label %{s}\n", .{avg_start});
+        try ctx.emitFmt("{s}:\n", .{avg_end});
     }
 }
 
@@ -170,8 +242,13 @@ fn genAccumulation(ctx: *CodegenContext, op: ast.AccumulationOp, lhs_ptr: []cons
             try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ new_val, old_val, rhs_val });
             try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, lhs_ptr });
         },
-        else => {
-            try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ rhs_val, lhs_ptr });
+        .avg => {
+            // For avg=: accumulate sum during loops, division happens after loops
+            const old_val = try ctx.newTemp();
+            try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, lhs_ptr });
+            const new_val = try ctx.newTemp();
+            try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, rhs_val });
+            try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, lhs_ptr });
         },
     }
 }
