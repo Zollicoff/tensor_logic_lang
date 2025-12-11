@@ -1,39 +1,36 @@
-# Tensor Logic Language - Architecture
-
-> Based on Pedro Domingos' paper "Tensor Logic: The Language of AI"
-
-## Core Philosophy
+# Architecture
 
 > "The sole construct in tensor logic is the tensor equation"
 
-This is a **standalone compiled language** - not a library, not an interpreter. It produces native executables via LLVM.
+## Overview
+
+Tensor Logic is a **compiled language** that produces native executables via LLVM.
 
 ```
 program.tl  →  tlc compile  →  LLVM IR  →  clang  →  native binary
 ```
 
-## Two Inference Modes (Both Compiled)
+## Two Inference Modes
 
-The paper describes two inference strategies. Both compile to native code:
+The compiler supports two inference strategies, both compiled to native code:
 
-### Forward Chaining (Implemented)
+### Forward Chaining
 - Compiles to **nested loops**
-- Computes ALL tensor elements eagerly
+- Computes all tensor elements eagerly
 - Iterates until fixpoint for recursive equations
 - Optimal for: neural networks, dense tensors
 
-### Backward Chaining (Planned)
-- Compiles to **recursive functions**
-- Computes ONLY what's queried (demand-driven)
-- Memoization to avoid redundant computation
+### Backward Chaining
+- Compiles to **recursive functions with memoization**
+- Computes only what's queried (demand-driven)
 - Optimal for: logic queries, sparse knowledge bases
 
 ```
-# Forward: compute everything
-Ancestor?           # → loops over all i,j
+// Forward: compute everything
+Ancestor?           // loops over all i,j
 
-# Backward: query-driven
-Ancestor[0,5]?      # → recursive call, traces dependencies
+// Backward: query-driven
+Ancestor[0,5]?      // recursive call, traces dependencies
 ```
 
 ## Pipeline
@@ -59,7 +56,7 @@ Native executable
 src/
 ├── main.zig              # CLI entry point
 │
-├── frontend/             # Parsing and analysis
+├── frontend/
 │   ├── lexer.zig         # Tokenization
 │   ├── parser.zig        # Recursive descent parser
 │   ├── ast.zig           # AST node definitions
@@ -67,74 +64,25 @@ src/
 │   ├── types.zig         # Type checking and inference
 │   └── optimize.zig      # AST optimization passes
 │
-├── codegen/              # LLVM IR generation
-│   ├── llvm.zig          # Main orchestrator
-│   ├── autodiff.zig      # Computation graph, gradient derivation
-│   ├── einsum.zig        # Einstein summation (forward: loops)
-│   ├── backward.zig      # Backward chaining (recursive fns + memoization)
-│   ├── softmax.zig       # Softmax with reduction
-│   ├── layernorm.zig     # Layer normalization
-│   ├── concat.zig        # Concatenation for attention heads
-│   ├── fixpoint.zig      # Recursive equation convergence
-│   ├── sparse.zig        # Sparse tensor support
-│   ├── tucker.zig        # Tucker decomposition for sparse→dense scaling
-│   ├── bp.zig            # Belief propagation helpers
-│   ├── gpu.zig           # GPU backends (CUDA/Metal templates)
-│   ├── tensor.zig        # Tensor allocation and indexing
+├── codegen/
+│   ├── llvm.zig          # Main LLVM IR orchestrator
+│   ├── einsum.zig        # Einstein summation loops
 │   ├── expr.zig          # Expression evaluation
-│   └── types.zig         # Shared types
+│   ├── tensor.zig        # Tensor allocation and indexing
+│   ├── fixpoint.zig      # Recursive equation convergence
+│   ├── backward.zig      # Backward chaining (recursive + memoization)
+│   ├── autodiff.zig      # Reverse-mode automatic differentiation
+│   ├── softmax.zig       # Softmax with numerically stable reduction
+│   ├── layernorm.zig     # Layer normalization
+│   ├── concat.zig        # Tensor concatenation
+│   ├── sparse.zig        # Sparse tensor support (COO format)
+│   ├── tucker.zig        # Tucker decomposition
+│   ├── bp.zig            # Belief propagation helpers
+│   ├── gpu.zig           # GPU backend templates (CUDA/Metal)
+│   └── types.zig         # Shared codegen types
 │
-└── lsp/                  # IDE support
-    └── server.zig        # VS Code language server
-```
-
-## Implementation Status
-
-### Complete ✅
-- Lexer, parser, AST, type checker
-- Einstein summation with implicit contraction
-- All nonlinearities: step, relu, sigmoid, tanh, softmax, lnorm, exp, log, sqrt, abs, sin, cos
-- Accumulation operators: `=`, `+=`, `max=`, `min=`, `*=`, `avg=`
-- Division indices `X/2` for pooling
-- Slice indices `X[4:8]` for subranges
-- Concat for attention head merging
-- Forward chaining with fixpoint iteration
-- **Backward chaining with memoization** (recursive functions for query-driven inference)
-- **Full autodiff**: tanh, exp, log, softmax gradients
-- **Temperature sigmoid**: `sigmoid(x, T)` for embedding space reasoning
-- **Sparse tensor support** (COO format allocation)
-- **File I/O**: `save`/`load` for tensor persistence
-- Virtual indices `*t`, primed indices `p'`, index arithmetic `i+1`
-- VS Code extension with LSP
-- **Tucker decomposition**: `tucker T(r1, r2, r3) from Source` for sparse→dense scaling
-- **Belief propagation**: Loopy BP is forward chaining (fixpoint + bp.zig helpers)
-
-### In Progress 🔧
-- GPU backends (CUDA/Metal) - kernel templates created, full runtime pending
-
-## Paper Features Mapping
-
-| Paper Feature | Status | Implementation |
-|--------------|--------|----------------|
-| Tensor equations | ✅ | Core syntax |
-| Einstein summation | ✅ | einsum.zig |
-| Forward chaining | ✅ | loops + fixpoint |
-| Backward chaining | ✅ | recursive functions + memoization |
-| Autodiff | ✅ | autodiff.zig (full) |
-| Sparse tensors | ✅ | sparse.zig (COO format) |
-| Temperature σ(x,T) | ✅ | sigmoid(x, T) for embedding reasoning |
-| Tucker decomposition | ✅ | tucker.zig (core tensor + factor matrices) |
-| Belief propagation | ✅ | fixpoint.zig + bp.zig (loopy BP = forward chaining) |
-| GPU acceleration | 🔧 | gpu.zig (CUDA/Metal templates) |
-
-## CLI
-
-```bash
-tlc build program.tl -o program   # Compile to native binary
-tlc compile program.tl -o out.ll  # Compile to LLVM IR
-tlc check program.tl              # Type check only
-tlc lex program.tl                # Show tokens
-tlc parse program.tl              # Show AST
+└── lsp/
+    └── server.zig        # Language server for VS Code
 ```
 
 ## Design Principles
@@ -144,4 +92,3 @@ tlc parse program.tl              # Show AST
 3. **Two modes**: Forward (loops) and backward (recursion) chaining
 4. **Declarative**: Equations state what, not how
 5. **Differentiable**: Gradients are also tensor equations
-6. **Faithful to paper**: 100% implementation of Domingos' Tensor Logic
