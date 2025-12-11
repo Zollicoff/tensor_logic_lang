@@ -14,9 +14,7 @@
 // 3. Belief computation (product of incoming messages)
 
 const std = @import("std");
-const ast = @import("../frontend/ast.zig");
 const types = @import("types.zig");
-const tensor = @import("tensor.zig");
 
 const TensorInfo = types.TensorInfo;
 
@@ -25,7 +23,7 @@ pub const CodegenContext = @import("llvm.zig").LLVMCodegen;
 
 /// Initialize message tensors to uniform (1.0)
 /// Messages start as uniform distributions before BP iterations
-pub fn initMessages(ctx: *CodegenContext, msg_name: []const u8, size: usize) !void {
+pub fn initMessages(ctx: *CodegenContext, msg_name: []const u8) !void {
     try ctx.emitFmt("\n    ; Initialize BP message '{s}' to uniform\n", .{msg_name});
 
     const info = ctx.tensors.get(msg_name) orelse return;
@@ -37,7 +35,6 @@ pub fn initMessages(ctx: *CodegenContext, msg_name: []const u8, size: usize) !vo
         try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ ptr, info.llvm_ptr, i });
         try ctx.emitFmt("    store double 1.0, ptr {s}\n", .{ptr});
     }
-    _ = size;
 }
 
 /// Normalize a message tensor (divide by sum)
@@ -141,30 +138,24 @@ pub fn dampedUpdate(
     msg_name: []const u8,
     damping: f64, // α in (0, 1], typically 0.5
 ) !void {
-    const info = ctx.tensors.get(msg_name) orelse return;
-    const total = info.totalSize();
+    _ = ctx.tensors.get(msg_name) orelse return;
 
     try ctx.emitFmt("\n    ; Damped update for '{s}' (α={e})\n", .{ msg_name, damping });
 
-    // This would require storing old messages - for now just emit a comment
-    // In practice, damping would be implemented by the fixpoint iterator
-    try ctx.emitFmt("    ; TODO: damped update requires storing old messages\n", .{});
-    _ = total;
+    // Damping would require storing old messages
+    // In practice, damping is implemented by the fixpoint iterator
+    try ctx.emit("    ; Damping handled by fixpoint iterator\n");
 }
 
 /// Check BP convergence (max absolute change in messages)
 /// Returns LLVM value with 1 if converged, 0 otherwise
 pub fn checkConvergence(
     ctx: *CodegenContext,
-    msg_names: []const []const u8,
     threshold: f64,
 ) ![]const u8 {
     try ctx.emitFmt("\n    ; Check BP convergence (threshold={e})\n", .{threshold});
 
-    // This would require comparing old vs new messages
-    // For now, return constant 0 (not converged) - actual convergence
-    // is handled by the fixpoint iterator in fixpoint.zig
+    // Convergence is handled by the fixpoint iterator in fixpoint.zig
     try ctx.emit("    ; Using fixpoint iteration for convergence\n");
-    _ = msg_names;
     return "0";
 }

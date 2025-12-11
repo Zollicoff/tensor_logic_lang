@@ -19,8 +19,6 @@
 // - Softmax → reduce + elementwise
 
 const std = @import("std");
-const ast = @import("../frontend/ast.zig");
-const types = @import("types.zig");
 
 /// GPU Backend type
 pub const Backend = enum {
