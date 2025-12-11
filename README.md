@@ -39,10 +39,10 @@ zig build
 Define index ranges:
 
 ```
-domain Batch(32)
-domain Input(784)
-domain Hidden(256)
-domain Output(10)
+domain b: 32
+domain i: 784
+domain h: 256
+domain o: 10
 ```
 
 ### Tensor Equations
@@ -144,34 +144,33 @@ load W from "weights.bin"
 ### Neural Network
 
 ```
-domain B(32)
-domain I(784)
-domain H(256)
-domain O(10)
+domain b: 32
+domain i: 784
+domain h: 256
+domain o: 10
 
-H[b,h] = relu(X[b,i] W1[i,h] + B1[h])
-Y[b,o] = softmax(H[b,h] W2[h,o] + B2[o])
+H[b,h] = relu(X[b,i] W1[i,h])
+Y[b,o] = softmax(H[b,h] W2[h,o])
 ```
 
 ### Transformer Attention
 
 ```
-domain Seq(128)
-domain Dim(64)
-domain Heads(8)
+domain s: 128
+domain d: 64
 
-// Multi-head attention
-Attn[h,q,k.] = softmax(Q[h,q,d] K[h,k,d] / 8.0)
-Head[h,q,d] = Attn[h,q,k] V[h,k,d]
-Out[q,o] = concat(Head[h,q,d], h) Wo[h,d,o]
+// Self-attention
+Scores[q,k] = Q[q,d] K[k,d]
+Attn[q,k] = softmax(Scores[q,k])
+Out[q,d] = Attn[q,k] V[k,d]
 ```
 
 ### Logic Programming
 
 ```
-domain Node(100)
+domain n: 100
 
-sparse Edge[Node, Node]
+sparse Edge[n, n]
 Edge[0,1] = 1
 Edge[1,2] = 1
 Edge[2,3] = 1
@@ -184,11 +183,11 @@ Reach[x,z] max= step(Reach[x,y] Edge[y,z])
 ### Probabilistic Inference
 
 ```
-domain State(10)
+domain s: 10
 
 // Belief propagation is forward chaining
 Belief[s] = Prior[s]
-Belief[s'] max= Belief[s] Transition[s,s'] Emission[s',obs]
+Belief[t] max= Belief[s] Transition[s,t] Emission[t,obs]
 ```
 
 ## CLI
