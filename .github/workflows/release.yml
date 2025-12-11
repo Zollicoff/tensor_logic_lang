@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig-url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+            zig-dir: zig-x86_64-linux-0.15.2
+            artifact: tlc-linux-x86_64
+          - os: macos-latest
+            zig-url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+            zig-dir: zig-aarch64-macos-0.15.2
+            artifact: tlc-macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and setup Zig
+        run: |
+          curl -L ${{ matrix.zig-url }} | tar -xJ
+          echo "$PWD/${{ matrix.zig-dir }}" >> $GITHUB_PATH
+
+      - name: Build release
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/tlc dist/${{ matrix.artifact }}
+          chmod +x dist/${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/**/*
+          generate_release_notes: true

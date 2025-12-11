@@ -1,0 +1,15 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Editor files
+*.swp
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

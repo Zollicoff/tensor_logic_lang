@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            zig-url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+            zig-dir: zig-x86_64-linux-0.15.2
+          - os: macos-latest
+            zig-url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
+            zig-dir: zig-aarch64-macos-0.15.2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and setup Zig
+        run: |
+          curl -L ${{ matrix.zig-url }} | tar -xJ
+          echo "$PWD/${{ matrix.zig-dir }}" >> $GITHUB_PATH
+
+      - name: Verify Zig
+        run: zig version
+
+      - name: Build
+        run: zig build
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Type check examples
+        run: |
+          for f in examples/*.tl; do
+            echo "Checking $f..."
+            ./zig-out/bin/tlc check "$f"
+          done

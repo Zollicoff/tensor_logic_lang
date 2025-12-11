@@ -1,0 +1,132 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Tensor Logic",
+  "scopeName": "source.tensorlogic",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#keywords" },
+    { "include": "#operators" },
+    { "include": "#nonlinearities" },
+    { "include": "#numbers" },
+    { "include": "#strings" },
+    { "include": "#tensors" },
+    { "include": "#indices" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.tensorlogic",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.tensorlogic",
+          "match": "\\b(domain|sparse|import|export|as|if|else|for|in|save|load|tucker|backward)\\b"
+        },
+        {
+          "name": "storage.type.tensorlogic",
+          "match": "\\b(real|int|bool|complex)\\b"
+        },
+        {
+          "name": "constant.language.tensorlogic",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "nonlinearities": {
+      "patterns": [
+        {
+          "name": "support.function.tensorlogic",
+          "match": "\\b(step|H|sigmoid|sig|relu|softmax|tanh|exp|log|abs|sqrt|sin|cos|norm|lnorm|concat|embed)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.tensorlogic",
+          "match": "(\\+=|\\*=|max=|min=|avg=|=)"
+        },
+        {
+          "name": "keyword.operator.arithmetic.tensorlogic",
+          "match": "(\\+|-|\\*|/|\\^)"
+        },
+        {
+          "name": "keyword.operator.comparison.tensorlogic",
+          "match": "(==|!=|<=|>=|<|>)"
+        },
+        {
+          "name": "keyword.operator.logical.tensorlogic",
+          "match": "(&|\\||!)"
+        },
+        {
+          "name": "keyword.operator.query.tensorlogic",
+          "match": "\\?"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.tensorlogic",
+          "match": "\\b\\d+\\.\\d+([eE][+-]?\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.tensorlogic",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.tensorlogic",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.tensorlogic",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "tensors": {
+      "patterns": [
+        {
+          "name": "entity.name.function.tensorlogic",
+          "match": "\\b([A-Z][A-Za-z0-9_]*)\\s*(?=\\[|\\()"
+        },
+        {
+          "name": "variable.other.tensorlogic",
+          "match": "\\b([A-Z][A-Za-z0-9_]*)\\b"
+        }
+      ]
+    },
+    "indices": {
+      "patterns": [
+        {
+          "name": "variable.parameter.tensorlogic",
+          "match": "\\b([a-z][a-z0-9_]*)\\b(?=\\s*[,\\]\\):])"
+        },
+        {
+          "name": "variable.parameter.virtual.tensorlogic",
+          "match": "\\*([a-z][a-z0-9_]*)"
+        },
+        {
+          "name": "variable.parameter.primed.tensorlogic",
+          "match": "([a-z][a-z0-9_]*)'"
+        },
+        {
+          "name": "variable.parameter.normalize.tensorlogic",
+          "match": "([a-z][a-z0-9_]*)\\."
+        }
+      ]
+    }
+  }
+}
