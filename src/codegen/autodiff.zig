@@ -444,3 +444,639 @@ pub const GradRule = enum {
     exp_grad, // dL/dX = dL/dY * exp(X)
     log_grad, // dL/dX = dL/dY / X
 };
+
+// =============================================================================
+// Gradient Codegen - LLVM IR generation for gradient equations
+// =============================================================================
+
+const types = @import("types.zig");
+const TensorInfo = types.TensorInfo;
+
+/// Codegen context type (forward declaration to avoid circular import)
+pub const CodegenContext = @import("llvm.zig").LLVMCodegen;
+
+/// Generate LLVM IR for a gradient equation
+pub fn genGradEquation(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    try ctx.emitFmt("    ; Gradient: {s} ({s})\n", .{ grad_eq.output, @tagName(grad_eq.rule) });
+
+    // Ensure output gradient tensor exists
+    if (!ctx.tensors.contains(grad_eq.output)) {
+        // Get the tensor we're computing gradient for (remove dL_d prefix)
+        const base_name = if (std.mem.startsWith(u8, grad_eq.output, "dL_d"))
+            grad_eq.output[4..]
+        else
+            grad_eq.output;
+
+        if (ctx.tensors.get(base_name)) |info| {
+            const ptr = try ctx.newTemp();
+            try ctx.emitFmt("    {s} = call ptr @calloc(i64 {d}, i64 8)\n", .{ ptr, info.totalSize() });
+            try ctx.tensors.put(ctx.allocator, grad_eq.output, .{
+                .name = grad_eq.output,
+                .llvm_ptr = ptr,
+                .rank = info.rank,
+                .dims = try ctx.allocator.dupe(usize, info.dims),
+                .strides = try ctx.allocator.dupe(usize, info.strides),
+            });
+        }
+    }
+
+    switch (grad_eq.rule) {
+        .pass_through => try genGradPassThrough(ctx, grad_eq),
+        .matmul_self => try genGradMatmulSelf(ctx, grad_eq),
+        .relu_grad => try genGradRelu(ctx, grad_eq),
+        .sigmoid_grad => try genGradSigmoid(ctx, grad_eq),
+        .matmul_left => try genGradMatmulLeft(ctx, grad_eq),
+        .matmul_right => try genGradMatmulRight(ctx, grad_eq),
+        .tanh_grad => try genGradTanh(ctx, grad_eq),
+        .exp_grad => try genGradExp(ctx, grad_eq),
+        .log_grad => try genGradLog(ctx, grad_eq),
+        .softmax_grad => try genGradSoftmax(ctx, grad_eq),
+        else => {
+            try ctx.emitFmt("    ; TODO: gradient rule {s}\n", .{@tagName(grad_eq.rule)});
+        },
+    }
+}
+
+fn genGradPassThrough(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+
+    const total = upstream_info.totalSize();
+    for (0..total) |i| {
+        const src_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ src_ptr, upstream_info.llvm_ptr, i });
+        const val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ val, src_ptr });
+
+        const dst_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ dst_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, dst_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, val });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, dst_ptr });
+    }
+}
+
+fn genGradRelu(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const input_info = ctx.tensors.get(grad_eq.operands[0]) orelse return;
+
+    const total = upstream_info.totalSize();
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const in_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ in_ptr, input_info.llvm_ptr, i });
+        const in_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ in_val, in_ptr });
+
+        const cmp = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fcmp ogt double {s}, 0.0\n", .{ cmp, in_val });
+        const step_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = select i1 {s}, double 1.0, double 0.0\n", .{ step_val, cmp });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, step_val });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradSigmoid(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const sigmoid_output_info = ctx.tensors.get(grad_eq.operands[1]) orelse return;
+
+    const total = upstream_info.totalSize();
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const y_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, sigmoid_output_info.llvm_ptr, i });
+        const y_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+        const one_minus_y = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fsub double 1.0, {s}\n", .{ one_minus_y, y_val });
+        const deriv = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ deriv, y_val, one_minus_y });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, deriv });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradTanh(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const tanh_output_info = ctx.tensors.get(grad_eq.operands[1]) orelse return;
+
+    const total = upstream_info.totalSize();
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const y_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, tanh_output_info.llvm_ptr, i });
+        const y_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+        const y_sq = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ y_sq, y_val, y_val });
+        const deriv = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fsub double 1.0, {s}\n", .{ deriv, y_sq });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, deriv });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradExp(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const exp_output_info = ctx.tensors.get(grad_eq.operands[1]) orelse return;
+
+    const total = upstream_info.totalSize();
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const y_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, exp_output_info.llvm_ptr, i });
+        const y_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, up_val, y_val });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradLog(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const input_info = ctx.tensors.get(grad_eq.operands[0]) orelse return;
+
+    const total = upstream_info.totalSize();
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const x_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ x_ptr, input_info.llvm_ptr, i });
+        const x_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ x_val, x_ptr });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fdiv double {s}, {s}\n", .{ grad, up_val, x_val });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradSoftmax(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const softmax_output_info = ctx.tensors.get(grad_eq.operands[1]) orelse return;
+
+    const total = upstream_info.totalSize();
+
+    // First compute sum_j(dL/dY[j] * Y[j])
+    const dot_sum = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = alloca double\n", .{dot_sum});
+    try ctx.emitFmt("    store double 0.0, ptr {s}\n", .{dot_sum});
+
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const y_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, softmax_output_info.llvm_ptr, i });
+        const y_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+        const prod = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ prod, up_val, y_val });
+
+        const old_sum = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_sum, dot_sum });
+        const new_sum = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_sum, old_sum, prod });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_sum, dot_sum });
+    }
+
+    const sum_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ sum_val, dot_sum });
+
+    for (0..total) |i| {
+        const up_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ up_ptr, upstream_info.llvm_ptr, i });
+        const up_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ up_val, up_ptr });
+
+        const y_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, softmax_output_info.llvm_ptr, i });
+        const y_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+        const diff = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fsub double {s}, {s}\n", .{ diff, up_val, sum_val });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, y_val, diff });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradMatmulSelf(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const input_name = grad_eq.operands[0];
+    const input_info = ctx.tensors.get(input_name) orelse return;
+
+    const total = input_info.totalSize();
+    for (0..total) |i| {
+        const y_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ y_ptr, input_info.llvm_ptr, i });
+        const y_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ y_val, y_ptr });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, 2.0\n", .{ grad, y_val });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradMatmulLeft(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+
+    if (grad_eq.operands.len < 3) return;
+    const b_name = grad_eq.operands[1];
+    const b_info = ctx.tensors.get(b_name) orelse return;
+
+    const upstream_is_scalar = upstream_info.totalSize() == 1;
+    const output_is_1d = output_info.dims.len == 1;
+
+    if (upstream_is_scalar and output_is_1d) {
+        try genGradDotProductLeft(ctx, grad_eq, output_info, upstream_info, b_info);
+        return;
+    }
+
+    const dim_i = if (output_info.dims.len > 0) output_info.dims[0] else 1;
+    const dim_j = if (output_info.dims.len > 1) output_info.dims[1] else 1;
+    const dim_k = if (upstream_info.dims.len > 1) upstream_info.dims[1] else 1;
+
+    const i_var = try ctx.newTemp();
+    const j_var = try ctx.newTemp();
+    const k_var = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = alloca i64\n", .{i_var});
+    try ctx.emitFmt("    {s} = alloca i64\n", .{j_var});
+    try ctx.emitFmt("    {s} = alloca i64\n", .{k_var});
+
+    const i_start = try ctx.newLabel();
+    const i_body = try ctx.newLabel();
+    const i_end = try ctx.newLabel();
+
+    try ctx.emitFmt("    store i64 0, ptr {s}\n", .{i_var});
+    try ctx.emitFmt("    br label %{s}\n", .{i_start});
+    try ctx.emitFmt("{s}:\n", .{i_start});
+    const i_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ i_val, i_var });
+    const i_cmp = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ i_cmp, i_val, dim_i });
+    try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ i_cmp, i_body, i_end });
+    try ctx.emitFmt("{s}:\n", .{i_body});
+
+    const j_start = try ctx.newLabel();
+    const j_body = try ctx.newLabel();
+    const j_end = try ctx.newLabel();
+
+    try ctx.emitFmt("    store i64 0, ptr {s}\n", .{j_var});
+    try ctx.emitFmt("    br label %{s}\n", .{j_start});
+    try ctx.emitFmt("{s}:\n", .{j_start});
+    const j_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ j_val, j_var });
+    const j_cmp = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ j_cmp, j_val, dim_j });
+    try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ j_cmp, j_body, j_end });
+    try ctx.emitFmt("{s}:\n", .{j_body});
+
+    const k_start = try ctx.newLabel();
+    const k_body = try ctx.newLabel();
+    const k_end = try ctx.newLabel();
+
+    try ctx.emitFmt("    store i64 0, ptr {s}\n", .{k_var});
+    try ctx.emitFmt("    br label %{s}\n", .{k_start});
+    try ctx.emitFmt("{s}:\n", .{k_start});
+    const k_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ k_val, k_var });
+    const k_cmp = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ k_cmp, k_val, dim_k });
+    try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ k_cmp, k_body, k_end });
+    try ctx.emitFmt("{s}:\n", .{k_body});
+
+    const c_offset = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = mul i64 {s}, {d}\n", .{ c_offset, i_val, dim_k });
+    const c_offset2 = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, {s}\n", .{ c_offset2, c_offset, k_val });
+    const c_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ c_ptr, upstream_info.llvm_ptr, c_offset2 });
+    const dc_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ dc_val, c_ptr });
+
+    const b_offset = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = mul i64 {s}, {d}\n", .{ b_offset, j_val, dim_k });
+    const b_offset2 = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, {s}\n", .{ b_offset2, b_offset, k_val });
+    const b_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ b_ptr, b_info.llvm_ptr, b_offset2 });
+    const b_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ b_val, b_ptr });
+
+    const prod = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ prod, dc_val, b_val });
+
+    const a_offset = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = mul i64 {s}, {d}\n", .{ a_offset, i_val, dim_j });
+    const a_offset2 = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, {s}\n", .{ a_offset2, a_offset, j_val });
+    const out_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ out_ptr, output_info.llvm_ptr, a_offset2 });
+    const old_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+    const new_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, prod });
+    try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+
+    const k_next = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ k_next, k_val });
+    try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ k_next, k_var });
+    try ctx.emitFmt("    br label %{s}\n", .{k_start});
+    try ctx.emitFmt("{s}:\n", .{k_end});
+
+    const j_next = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ j_next, j_val });
+    try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ j_next, j_var });
+    try ctx.emitFmt("    br label %{s}\n", .{j_start});
+    try ctx.emitFmt("{s}:\n", .{j_end});
+
+    const i_next = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ i_next, i_val });
+    try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ i_next, i_var });
+    try ctx.emitFmt("    br label %{s}\n", .{i_start});
+    try ctx.emitFmt("{s}:\n", .{i_end});
+}
+
+fn genGradMatmulRight(ctx: *CodegenContext, grad_eq: *const GradEquation) !void {
+    const output_info = ctx.tensors.get(grad_eq.output) orelse return;
+    const upstream_info = ctx.tensors.get(grad_eq.grad_upstream) orelse return;
+
+    if (grad_eq.operands.len < 3) return;
+    const a_name = grad_eq.operands[0];
+    const a_info = ctx.tensors.get(a_name) orelse return;
+
+    const upstream_is_scalar = upstream_info.totalSize() == 1;
+    const output_is_1d = output_info.dims.len == 1;
+
+    if (upstream_is_scalar and output_is_1d) {
+        try genGradDotProductRight(ctx, grad_eq, output_info, upstream_info, a_info);
+        return;
+    }
+
+    const dim_i = if (a_info.dims.len > 0) a_info.dims[0] else 1;
+    const dim_j = if (output_info.dims.len > 0) output_info.dims[0] else 1;
+    const dim_k = if (output_info.dims.len > 1) output_info.dims[1] else 1;
+
+    const i_var = try ctx.newTemp();
+    const j_var = try ctx.newTemp();
+    const k_var = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = alloca i64\n", .{i_var});
+    try ctx.emitFmt("    {s} = alloca i64\n", .{j_var});
+    try ctx.emitFmt("    {s} = alloca i64\n", .{k_var});
+
+    const j_start = try ctx.newLabel();
+    const j_body = try ctx.newLabel();
+    const j_end = try ctx.newLabel();
+
+    try ctx.emitFmt("    store i64 0, ptr {s}\n", .{j_var});
+    try ctx.emitFmt("    br label %{s}\n", .{j_start});
+    try ctx.emitFmt("{s}:\n", .{j_start});
+    const j_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ j_val, j_var });
+    const j_cmp = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ j_cmp, j_val, dim_j });
+    try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ j_cmp, j_body, j_end });
+    try ctx.emitFmt("{s}:\n", .{j_body});
+
+    const k_start = try ctx.newLabel();
+    const k_body = try ctx.newLabel();
+    const k_end = try ctx.newLabel();
+
+    try ctx.emitFmt("    store i64 0, ptr {s}\n", .{k_var});
+    try ctx.emitFmt("    br label %{s}\n", .{k_start});
+    try ctx.emitFmt("{s}:\n", .{k_start});
+    const k_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ k_val, k_var });
+    const k_cmp = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ k_cmp, k_val, dim_k });
+    try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ k_cmp, k_body, k_end });
+    try ctx.emitFmt("{s}:\n", .{k_body});
+
+    const i_start = try ctx.newLabel();
+    const i_body = try ctx.newLabel();
+    const i_end = try ctx.newLabel();
+
+    try ctx.emitFmt("    store i64 0, ptr {s}\n", .{i_var});
+    try ctx.emitFmt("    br label %{s}\n", .{i_start});
+    try ctx.emitFmt("{s}:\n", .{i_start});
+    const i_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load i64, ptr {s}\n", .{ i_val, i_var });
+    const i_cmp = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = icmp slt i64 {s}, {d}\n", .{ i_cmp, i_val, dim_i });
+    try ctx.emitFmt("    br i1 {s}, label %{s}, label %{s}\n", .{ i_cmp, i_body, i_end });
+    try ctx.emitFmt("{s}:\n", .{i_body});
+
+    const a_offset = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = mul i64 {s}, {d}\n", .{ a_offset, i_val, dim_j });
+    const a_offset2 = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, {s}\n", .{ a_offset2, a_offset, j_val });
+    const a_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ a_ptr, a_info.llvm_ptr, a_offset2 });
+    const a_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ a_val, a_ptr });
+
+    const c_offset = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = mul i64 {s}, {d}\n", .{ c_offset, i_val, dim_k });
+    const c_offset2 = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, {s}\n", .{ c_offset2, c_offset, k_val });
+    const c_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ c_ptr, upstream_info.llvm_ptr, c_offset2 });
+    const dc_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ dc_val, c_ptr });
+
+    const prod = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ prod, a_val, dc_val });
+
+    const b_offset = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = mul i64 {s}, {d}\n", .{ b_offset, j_val, dim_k });
+    const b_offset2 = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, {s}\n", .{ b_offset2, b_offset, k_val });
+    const out_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {s}\n", .{ out_ptr, output_info.llvm_ptr, b_offset2 });
+    const old_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+    const new_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, prod });
+    try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+
+    const i_next = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ i_next, i_val });
+    try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ i_next, i_var });
+    try ctx.emitFmt("    br label %{s}\n", .{i_start});
+    try ctx.emitFmt("{s}:\n", .{i_end});
+
+    const k_next = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ k_next, k_val });
+    try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ k_next, k_var });
+    try ctx.emitFmt("    br label %{s}\n", .{k_start});
+    try ctx.emitFmt("{s}:\n", .{k_end});
+
+    const j_next = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = add i64 {s}, 1\n", .{ j_next, j_val });
+    try ctx.emitFmt("    store i64 {s}, ptr {s}\n", .{ j_next, j_var });
+    try ctx.emitFmt("    br label %{s}\n", .{j_start});
+    try ctx.emitFmt("{s}:\n", .{j_end});
+}
+
+fn genGradDotProductLeft(
+    ctx: *CodegenContext,
+    grad_eq: *const GradEquation,
+    output_info: TensorInfo,
+    upstream_info: TensorInfo,
+    b_info: TensorInfo,
+) !void {
+    _ = grad_eq;
+
+    const dy_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 0\n", .{ dy_ptr, upstream_info.llvm_ptr });
+    const dy_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ dy_val, dy_ptr });
+
+    const dim = output_info.dims[0];
+    for (0..dim) |i| {
+        const b_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ b_ptr, b_info.llvm_ptr, i });
+        const b_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ b_val, b_ptr });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, dy_val, b_val });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
+
+fn genGradDotProductRight(
+    ctx: *CodegenContext,
+    grad_eq: *const GradEquation,
+    output_info: TensorInfo,
+    upstream_info: TensorInfo,
+    a_info: TensorInfo,
+) !void {
+    _ = grad_eq;
+
+    const dy_ptr = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 0\n", .{ dy_ptr, upstream_info.llvm_ptr });
+    const dy_val = try ctx.newTemp();
+    try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ dy_val, dy_ptr });
+
+    const dim = output_info.dims[0];
+    for (0..dim) |i| {
+        const a_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ a_ptr, a_info.llvm_ptr, i });
+        const a_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ a_val, a_ptr });
+
+        const grad = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fmul double {s}, {s}\n", .{ grad, dy_val, a_val });
+
+        const out_ptr = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = getelementptr double, ptr {s}, i64 {d}\n", .{ out_ptr, output_info.llvm_ptr, i });
+        const old_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = load double, ptr {s}\n", .{ old_val, out_ptr });
+        const new_val = try ctx.newTemp();
+        try ctx.emitFmt("    {s} = fadd double {s}, {s}\n", .{ new_val, old_val, grad });
+        try ctx.emitFmt("    store double {s}, ptr {s}\n", .{ new_val, out_ptr });
+    }
+}
