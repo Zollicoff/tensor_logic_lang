@@ -15,16 +15,19 @@ jobs:
             zig-url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
             zig-dir: zig-x86_64-linux-0.15.2
             artifact: tlc-linux-x86_64
+            binary: tlc
             target: ""
           - os: macos-latest
             zig-url: https://ziglang.org/download/0.15.2/zig-aarch64-macos-0.15.2.tar.xz
             zig-dir: zig-aarch64-macos-0.15.2
             artifact: tlc-macos-aarch64
+            binary: tlc
             target: ""
           - os: ubuntu-latest
             zig-url: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
             zig-dir: zig-x86_64-linux-0.15.2
             artifact: tlc-windows-x86_64.exe
+            binary: tlc.exe
             target: x86_64-windows
 
     steps:
@@ -41,7 +44,7 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp zig-out/bin/tlc dist/${{ matrix.artifact }}
+          cp zig-out/bin/${{ matrix.binary }} dist/${{ matrix.artifact }}
           chmod +x dist/${{ matrix.artifact }}
 
       - name: Upload artifact
