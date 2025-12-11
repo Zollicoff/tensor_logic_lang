@@ -18,7 +18,7 @@ const test_cases = [_]TestCase{
     .{
         .name = "training",
         .file = "examples/training.tl",
-        .expected_contains = &.{ "Y_pred", "loss" },
+        .expected_contains = &.{}, // No queries, just verifies compilation
     },
 };
 

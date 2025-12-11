@@ -24,11 +24,7 @@
         "id": "tensorlogic",
         "aliases": ["Tensor Logic", "tensorlogic", "tl"],
         "extensions": [".tl"],
-        "configuration": "./language-configuration.json",
-        "icon": {
-          "light": "./icons/tl-icon.png",
-          "dark": "./icons/tl-icon.png"
-        }
+        "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [

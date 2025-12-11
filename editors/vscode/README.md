@@ -44,7 +44,7 @@ Language support for Tensor Logic (`.tl` files).
 ## Syntax Highlighting
 
 The extension provides highlighting for:
-- **Keywords**: `domain`, `sparse`, `import`, `export`, `if`, `else`, `save`, `load`
+- **Keywords**: `domain`, `sparse`, `import`, `export`, `if`, `else`, `save`, `load`, `backward`, `tucker`
 - **Nonlinearities**: `step`, `relu`, `sigmoid`, `softmax`, `tanh`, `exp`, `log`, `lnorm`, etc.
 - **Operators**: `=`, `+=`, `*=`, `max=`, `min=`, `avg=`
 - **Tensors**: Capitalized names like `X`, `Weight`, `Output`
