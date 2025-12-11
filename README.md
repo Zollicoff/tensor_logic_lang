@@ -129,14 +129,15 @@ Ancestor[x,y] = Parent[x,y]
 Ancestor[x,z] max= Ancestor[x,y] Parent[y,z]
 
 // Query specific values (computes only what's needed)
-backward Ancestor[0, 5]?
+// Constant indices trigger backward chaining automatically
+Ancestor[0, 5]?
 ```
 
 ### File I/O
 
 ```
-save W to "weights.bin"
-load W from "weights.bin"
+save W "weights.bin"
+load W "weights.bin"
 ```
 
 ## Examples
