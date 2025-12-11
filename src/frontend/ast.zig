@@ -288,11 +288,21 @@ pub const Backward = struct {
     location: SourceLocation,
 };
 
+/// Tucker decomposition declaration: tucker TensorName(r1, r2, r3) from Source
+/// Decomposes a tensor into core tensor + factor matrices for dense approximation
+pub const TuckerDecl = struct {
+    name: []const u8, // Name of the Tucker-decomposed tensor
+    core_ranks: []const i64, // Ranks for core tensor dimensions
+    source: ?[]const u8, // Optional source tensor to decompose
+    location: SourceLocation,
+};
+
 /// Top-level statement
 pub const Statement = union(enum) {
     equation: Equation,
     domain_decl: DomainDecl,
     sparse_decl: SparseDecl,
+    tucker_decl: TuckerDecl,
     import_stmt: Import,
     export_stmt: Export,
     query: Query,

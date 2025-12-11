@@ -80,6 +80,7 @@ pub const TokenType = enum {
     kw_save,
     kw_load,
     kw_backward,
+    kw_tucker,
     kw_wrt,
 
     // Type keywords
@@ -163,6 +164,7 @@ pub const TokenType = enum {
             .kw_save => "save",
             .kw_load => "load",
             .kw_backward => "backward",
+            .kw_tucker => "tucker",
             .kw_wrt => "wrt",
             .kw_real => "real",
             .kw_int => "int",
@@ -247,6 +249,7 @@ pub const keywords = std.StaticStringMap(TokenType).initComptime(.{
     .{ "save", .kw_save },
     .{ "load", .kw_load },
     .{ "backward", .kw_backward },
+    .{ "tucker", .kw_tucker },
     .{ "wrt", .kw_wrt },
     .{ "real", .kw_real },
     .{ "int", .kw_int },

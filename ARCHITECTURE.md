@@ -77,6 +77,9 @@ src/
 │   ├── concat.zig        # Concatenation for attention heads
 │   ├── fixpoint.zig      # Recursive equation convergence
 │   ├── sparse.zig        # Sparse tensor support
+│   ├── tucker.zig        # Tucker decomposition for sparse→dense scaling
+│   ├── bp.zig            # Belief propagation helpers
+│   ├── gpu.zig           # GPU backends (CUDA/Metal templates)
 │   ├── tensor.zig        # Tensor allocation and indexing
 │   ├── expr.zig          # Expression evaluation
 │   └── types.zig         # Shared types
@@ -103,10 +106,11 @@ src/
 - **File I/O**: `save`/`load` for tensor persistence
 - Virtual indices `*t`, primed indices `p'`, index arithmetic `i+1`
 - VS Code extension with LSP
+- **Tucker decomposition**: `tucker T(r1, r2, r3) from Source` for sparse→dense scaling
+- **Belief propagation**: Loopy BP is forward chaining (fixpoint + bp.zig helpers)
 
-### Planned 📋
-- Tucker decomposition for scaling sparse→dense
-- GPU backends (CUDA/Metal)
+### In Progress 🔧
+- GPU backends (CUDA/Metal) - kernel templates created, full runtime pending
 
 ## Paper Features Mapping
 
@@ -119,7 +123,9 @@ src/
 | Autodiff | ✅ | autodiff.zig (full) |
 | Sparse tensors | ✅ | sparse.zig (COO format) |
 | Temperature σ(x,T) | ✅ | sigmoid(x, T) for embedding reasoning |
-| Tucker decomposition | 📋 | Scaling strategy |
+| Tucker decomposition | ✅ | tucker.zig (core tensor + factor matrices) |
+| Belief propagation | ✅ | fixpoint.zig + bp.zig (loopy BP = forward chaining) |
+| GPU acceleration | 🔧 | gpu.zig (CUDA/Metal templates) |
 
 ## CLI
 

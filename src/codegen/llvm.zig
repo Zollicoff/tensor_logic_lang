@@ -25,6 +25,7 @@ const autodiff = @import("autodiff.zig");
 const concat = @import("concat.zig");
 const backward = @import("backward.zig");
 const sparse = @import("sparse.zig");
+const tucker = @import("tucker.zig");
 
 // Re-export types
 pub const TensorInfo = types.TensorInfo;
@@ -56,6 +57,9 @@ pub const LLVMCodegen = struct {
     // Track sparse tensors (COO format)
     sparse_tensors: std.StringHashMapUnmanaged(sparse.SparseInfo),
 
+    // Track Tucker-decomposed tensors
+    tucker_tensors: std.StringHashMapUnmanaged(tucker.TuckerInfo),
+
     pub fn init(allocator: std.mem.Allocator) LLVMCodegen {
         return .{
             .allocator = allocator,
@@ -69,6 +73,7 @@ pub const LLVMCodegen = struct {
             .tensor_max_dims = .{},
             .backward_tensors = .{},
             .sparse_tensors = .{},
+            .tucker_tensors = .{},
         };
     }
 
@@ -89,6 +94,7 @@ pub const LLVMCodegen = struct {
         self.tensor_max_dims.deinit(self.allocator);
         self.backward_tensors.deinit(self.allocator);
         self.sparse_tensors.deinit(self.allocator);
+        self.tucker_tensors.deinit(self.allocator);
     }
 
     // =========================================================================
@@ -339,6 +345,7 @@ pub const LLVMCodegen = struct {
             .equation => |eq| try self.genEquation(&eq),
             .query => |q| try self.genQuery(&q),
             .sparse_decl => |s| try self.genSparseDecl(&s),
+            .tucker_decl => |t| try self.genTuckerDecl(&t),
             .backward_stmt => |b| try self.genBackward(&b, program),
             .save_stmt => |s| try self.genSave(&s),
             .load_stmt => |l| try self.genLoad(&l),
@@ -506,6 +513,53 @@ pub const LLVMCodegen = struct {
         }
 
         try tensor_mod.allocateTensor(self, decl.name, indices.items);
+    }
+
+    fn genTuckerDecl(self: *LLVMCodegen, decl: *const ast.TuckerDecl) !void {
+        try self.emitFmt("\n    ; Tucker decomposition: {s}\n", .{decl.name});
+
+        // Get dimensions from source tensor or infer from domains
+        var dims = std.ArrayListUnmanaged(usize){};
+        defer dims.deinit(self.allocator);
+
+        // If source tensor exists, get its dimensions
+        if (decl.source) |source_name| {
+            if (self.tensors.get(source_name)) |source_info| {
+                for (source_info.dims) |d| {
+                    try dims.append(self.allocator, d);
+                }
+            }
+        }
+
+        // If no source or source not found, use core ranks as dimension hints
+        if (dims.items.len == 0) {
+            for (decl.core_ranks) |r| {
+                // Use rank * 2 as default dimension (approximation)
+                try dims.append(self.allocator, @as(usize, @intCast(r)) * 2);
+            }
+        }
+
+        // Convert core ranks to usize
+        var core_ranks = std.ArrayListUnmanaged(usize){};
+        defer core_ranks.deinit(self.allocator);
+        for (decl.core_ranks) |r| {
+            try core_ranks.append(self.allocator, @as(usize, @intCast(r)));
+        }
+
+        // Allocate Tucker structure
+        const tucker_info = try tucker.genTuckerAlloc(self, decl.name, dims.items, core_ranks.items);
+        try self.tucker_tensors.put(self.allocator, decl.name, tucker_info);
+
+        // Initialize with random values (or HOSVD from source if available)
+        if (decl.source) |source_name| {
+            if (self.tensors.get(source_name)) |source_info| {
+                try tucker.genHOSVD(self, &tucker_info, source_info.llvm_ptr);
+            } else {
+                try tucker.genTuckerRandomInit(self, &tucker_info);
+            }
+        } else {
+            try tucker.genTuckerRandomInit(self, &tucker_info);
+        }
     }
 
     fn genSave(self: *LLVMCodegen, save: *const ast.Save) !void {

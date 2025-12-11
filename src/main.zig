@@ -390,6 +390,11 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
                 defer allocator.free(msg);
                 stdout.writeAll(msg) catch continue;
             },
+            .tucker_decl => |t| {
+                const msg = std.fmt.allocPrint(allocator, "Tucker: {s} ({d} ranks)\n", .{ t.name, t.core_ranks.len }) catch continue;
+                defer allocator.free(msg);
+                stdout.writeAll(msg) catch continue;
+            },
             .import_stmt => |im| {
                 const msg = std.fmt.allocPrint(allocator, "Import: {s}\n", .{im.path}) catch continue;
                 defer allocator.free(msg);

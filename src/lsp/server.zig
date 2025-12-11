@@ -350,7 +350,7 @@ pub const LspServer = struct {
         var first = true;
 
         // Add keywords
-        const keywords = [_][]const u8{ "domain", "sparse", "import", "export", "if", "else", "save", "load" };
+        const keywords = [_][]const u8{ "domain", "sparse", "import", "export", "if", "else", "save", "load", "tucker", "backward" };
         for (keywords) |kw| {
             if (!first) try completions.appendSlice(self.allocator, ",");
             first = false;
@@ -456,6 +456,8 @@ pub const LspServer = struct {
             .{ .name = "lnorm", .info = "**lnorm** - Layer normalization\\n\\n`(x - mean) / std` per row" },
             .{ .name = "norm", .info = "**norm** - L2 norm\\n\\n`||x||_2 = sqrt(sum(x_i^2))`" },
             .{ .name = "concat", .info = "**concat** - Concatenation along axis" },
+            .{ .name = "tucker", .info = "**tucker** - Tucker decomposition\\n\\n`tucker T(r1, r2, r3) from Source`\\n\\nDecomposes tensor into core + factor matrices for sparse→dense scaling" },
+            .{ .name = "backward", .info = "**backward** - Backward chaining mode\\n\\n`backward T[0,5]?`\\n\\nQuery-driven recursive inference with memoization" },
         };
 
         for (keyword_info) |kw| {

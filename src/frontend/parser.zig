@@ -127,6 +127,9 @@ pub const Parser = struct {
         if (self.check(.kw_sparse)) {
             return self.parseSparseDecl();
         }
+        if (self.check(.kw_tucker)) {
+            return self.parseTuckerDecl();
+        }
         if (self.check(.kw_import)) {
             return self.parseImport();
         }
@@ -795,6 +798,67 @@ pub const Parser = struct {
                 .name = name_tok.lexeme,
                 .indices = indices.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
                 .is_boolean = is_boolean,
+                .location = location,
+            },
+        };
+    }
+
+    /// Parse Tucker decomposition declaration
+    /// Syntax: tucker TensorName(r1, r2, r3) from SourceTensor
+    /// or: tucker TensorName(r1, r2, r3)
+    fn parseTuckerDecl(self: *Parser) ParseError!ast.Statement {
+        const location = self.peek().location;
+        _ = self.advance(); // consume 'tucker'
+
+        if (!self.check(.identifier)) {
+            self.recordError("expected tensor name after 'tucker'");
+            return ParseError.ExpectedIdentifier;
+        }
+        const name_tok = self.advance();
+
+        // Parse core ranks: (r1, r2, r3)
+        var ranks = std.ArrayListUnmanaged(i64){};
+
+        if (self.match(.lparen)) {
+            while (!self.check(.rparen) and !self.isAtEnd()) {
+                if (self.check(.integer)) {
+                    const rank_tok = self.advance();
+                    const rank = std.fmt.parseInt(i64, rank_tok.lexeme, 10) catch return ParseError.InvalidIndex;
+                    ranks.append(self.allocator, rank) catch return ParseError.OutOfMemory;
+
+                    if (!self.check(.rparen)) {
+                        if (!self.match(.comma)) {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if (!self.match(.rparen)) {
+                self.recordError("expected ')' after core ranks");
+                return ParseError.ExpectedClosingParen;
+            }
+        }
+
+        // Parse optional 'from SourceTensor'
+        var source: ?[]const u8 = null;
+        if (self.check(.identifier)) {
+            const maybe_from = self.peek();
+            if (std.mem.eql(u8, maybe_from.lexeme, "from")) {
+                _ = self.advance(); // consume 'from'
+                if (self.check(.identifier)) {
+                    source = self.advance().lexeme;
+                }
+            }
+        }
+
+        return ast.Statement{
+            .tucker_decl = .{
+                .name = name_tok.lexeme,
+                .core_ranks = ranks.toOwnedSlice(self.allocator) catch return ParseError.OutOfMemory,
+                .source = source,
                 .location = location,
             },
         };

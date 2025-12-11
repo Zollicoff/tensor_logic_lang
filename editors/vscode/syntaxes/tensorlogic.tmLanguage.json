@@ -25,7 +25,7 @@
       "patterns": [
         {
           "name": "keyword.control.tensorlogic",
-          "match": "\\b(domain|sparse|import|export|as|if|else|for|in|save|load)\\b"
+          "match": "\\b(domain|sparse|import|export|as|if|else|for|in|save|load|tucker|backward)\\b"
         },
         {
           "name": "storage.type.tensorlogic",
