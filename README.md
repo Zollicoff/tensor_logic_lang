@@ -1,5 +1,7 @@
 # Tensor Logic
 
+[![CI](https://github.com/Zollicoff/tensor_logic_lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Zollicoff/tensor_logic_lang/actions/workflows/ci.yml)
+
 A compiled language where everything is a tensor equation.
 
 Based on Pedro Domingos' paper "[Tensor Logic: The Language of AI](https://arxiv.org/abs/2510.12269)".
@@ -21,12 +23,25 @@ Ancestor[x,z] max= step(Ancestor[x,y] Parent[y,z])
 Attn[q,k.] = softmax(Q[q,d] K[k,d] / 8.0)
 ```
 
+## Installation
+
+### Prebuilt Binaries
+
+Download the latest release for your platform from [Releases](https://github.com/Zollicoff/tensor_logic_lang/releases):
+- `tlc-linux-x86_64` - Linux
+- `tlc-macos-x86_64` - macOS Intel
+- `tlc-macos-aarch64` - macOS Apple Silicon
+
+### Build from Source
+
+```bash
+# Requires Zig 0.13+ and Clang
+zig build
+```
+
 ## Quick Start
 
 ```bash
-# Build the compiler
-zig build
-
 # Compile and run
 ./zig-out/bin/tlc build examples/matmul.tl -o matmul
 ./matmul
@@ -210,9 +225,7 @@ Install the extension from `editors/vscode/` for:
 - Autocomplete
 - Real-time error diagnostics
 
-## Building
-
-Requires Zig 0.15+ and Clang.
+## Development
 
 ```bash
 zig build                        # Debug build
