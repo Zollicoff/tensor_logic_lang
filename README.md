@@ -30,6 +30,7 @@ Attn[q,k.] = softmax(Q[q,d] K[k,d] / 8.0)
 Download the latest release for your platform from [Releases](https://github.com/Zollicoff/tensor_logic_lang/releases):
 - `tlc-linux-x86_64` - Linux
 - `tlc-macos-aarch64` - macOS Apple Silicon
+- `tlc-windows-x86_64.exe` - Windows
 
 ### Build from Source
 

@@ -180,16 +180,24 @@ fn buildFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]con
     defer allocator.free(llvm_ir);
 
     // Determine output name
+    const is_windows = @import("builtin").os.tag == .windows;
     const out_name = output_path orelse blk: {
-        // Strip .tl extension if present, otherwise use "a.out"
+        // Strip .tl extension if present, otherwise use default
         if (std.mem.endsWith(u8, path, ".tl")) {
             break :blk path[0 .. path.len - 3];
         }
-        break :blk "a.out";
+        break :blk if (is_windows) "a.exe" else "a.out";
     };
 
-    // Write LLVM IR to temp file
-    const tmp_ll = std.fmt.allocPrint(allocator, "/tmp/tlc_{d}.ll", .{std.time.milliTimestamp()}) catch {
+    // Write LLVM IR to temp file (cross-platform)
+    const tmp_dir = if (@import("builtin").os.tag == .windows)
+        std.process.getEnvVarOwned(allocator, "TEMP") catch std.process.getEnvVarOwned(allocator, "TMP") catch null
+    else
+        null;
+    defer if (tmp_dir) |dir| allocator.free(dir);
+
+    const tmp_prefix = tmp_dir orelse "/tmp";
+    const tmp_ll = std.fmt.allocPrint(allocator, "{s}/tlc_{d}.ll", .{ tmp_prefix, std.time.milliTimestamp() }) catch {
         std.debug.print("Error: out of memory\n", .{});
         return;
     };
@@ -206,14 +214,13 @@ fn buildFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]con
     };
     tmp_file.close();
 
-    // Invoke clang
-    var child = std.process.Child.init(&[_][]const u8{
-        "clang",
-        tmp_ll,
-        "-o",
-        out_name,
-        "-lm",
-    }, allocator);
+    // Invoke clang (Windows doesn't need -lm)
+    const clang_args = if (is_windows)
+        &[_][]const u8{ "clang", tmp_ll, "-o", out_name }
+    else
+        &[_][]const u8{ "clang", tmp_ll, "-o", out_name, "-lm" };
+
+    var child = std.process.Child.init(clang_args, allocator);
 
     child.spawn() catch |err| {
         std.debug.print("Error: failed to run clang: {}\n", .{err});
