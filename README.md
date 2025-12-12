@@ -168,6 +168,38 @@ Ancestor[x,z] max= Ancestor[x,y] Parent[y,z]
 Ancestor[0, 5]?
 ```
 
+#### Forward vs Backward Mode
+
+The compiler automatically selects the execution mode based on query syntax:
+
+| Query Syntax | Mode | Behavior |
+|--------------|------|----------|
+| `Tensor?` | Forward | Computes entire tensor via nested loops |
+| `Tensor[0,5]?` | Backward | Computes only queried cell via recursion |
+
+**Forward mode** uses fixpoint iteration for recursive equations:
+- Iterates until convergence (no values change)
+- Maximum 1000 iterations for safety
+- Optimal for dense tensors, neural network layers
+
+**Backward mode** uses recursive functions with memoization:
+- Computes only what's needed (demand-driven)
+- Memoization prevents redundant computation
+- Optimal for sparse relations, logic programming queries
+
+#### Supported Operations by Mode
+
+Most operations work in both modes. Exceptions:
+
+| Operation | Forward | Backward | Notes |
+|-----------|---------|----------|-------|
+| softmax | ✓ | ✗ | Requires full tensor view for normalization |
+| lnorm | ✓ | ✗ | Requires mean/variance over axis |
+| concat | ✓ | ✗ | Changes tensor shape |
+| avg= | ✓ | ✗ | Requires element count tracking |
+
+All other nonlinearities (relu, sigmoid, step, tanh, exp, log, sqrt, abs) and accumulation operators (=, +=, max=, min=, *=) work in both modes.
+
 ### File I/O
 
 Save and load tensors in binary format (raw 64-bit floats, row-major order):

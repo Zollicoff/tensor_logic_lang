@@ -57,6 +57,11 @@ const test_cases = [_]TestCase{
         .mode = .check_only,
     },
     .{
+        .name = "backward_vs_forward",
+        .file = "examples/backward_vs_forward.tl",
+        .mode = .check_only,
+    },
+    .{
         .name = "fileio",
         .file = "examples/fileio.tl",
         .mode = .check_only,
