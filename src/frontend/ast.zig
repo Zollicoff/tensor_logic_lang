@@ -13,7 +13,7 @@ const SourceLocation = tokens.SourceLocation;
 // ============================================================================
 
 /// Represents different forms of tensor indices
-/// Examples: i, j, i+1, i-1, p', i:10, i/2, ~i (virtual)
+/// Examples: i, j, i+1, i-1, p', i:10, i/2, *i (virtual)
 pub const Index = union(enum) {
     /// Simple named index: i, j, k
     name: []const u8,
@@ -28,10 +28,11 @@ pub const Index = union(enum) {
         offset: i64,
     },
 
-    /// Virtual index for embedding: ~i
+    /// Virtual index for embedding: *i
     virtual: []const u8,
 
-    /// Normalized index for softmax: /i (normalizes over i)
+    /// Normalized index for softmax: i. (normalizes over i)
+    /// Parser accepts both i. and /i syntax
     normalize: []const u8,
 
     /// Primed index: p' (different dimension with same semantic meaning)
@@ -58,8 +59,8 @@ pub const Index = union(enum) {
                 if (a.op == .add) "+" else "-",
                 a.offset,
             }),
-            .virtual => |v| std.fmt.allocPrint(allocator, "~{s}", .{v}),
-            .normalize => |n| std.fmt.allocPrint(allocator, "/{s}", .{n}),
+            .virtual => |v| std.fmt.allocPrint(allocator, "*{s}", .{v}),
+            .normalize => |n| std.fmt.allocPrint(allocator, "{s}.", .{n}),
             .primed => |p| std.fmt.allocPrint(allocator, "{s}'", .{p}),
             .slice => |s| std.fmt.allocPrint(allocator, "{d}:{d}", .{ s.start, s.end }),
             .div => |d| std.fmt.allocPrint(allocator, "{s}/{d}", .{ d.index, d.divisor }),

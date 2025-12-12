@@ -48,6 +48,8 @@ pub const TensorType = struct {
     value_type: ValueType,
     shape: ?Shape,
     is_sparse: bool,
+    rank: ?usize = null,
+    first_defined_at: ?tokens.SourceLocation = null,
 
     pub fn boolean() TensorType {
         return .{ .value_type = .boolean, .shape = null, .is_sparse = false };
@@ -60,14 +62,49 @@ pub const TensorType = struct {
     pub fn unknown() TensorType {
         return .{ .value_type = .unknown, .shape = null, .is_sparse = false };
     }
+
+    pub fn withRank(value_type: ValueType, rank: usize, location: tokens.SourceLocation) TensorType {
+        return .{
+            .value_type = value_type,
+            .shape = null,
+            .is_sparse = false,
+            .rank = rank,
+            .first_defined_at = location,
+        };
+    }
+};
+
+/// Error severity levels
+pub const Severity = enum {
+    @"error", // Blocks compilation
+    warning, // Allowed but suspicious
+    hint, // Informational
+
+    pub fn format(self: Severity) []const u8 {
+        return switch (self) {
+            .@"error" => "error",
+            .warning => "warning",
+            .hint => "note",
+        };
+    }
 };
 
 /// Type error information
 pub const TypeError = struct {
     message: []const u8,
     location: tokens.SourceLocation,
-    expected: ?ValueType,
-    found: ?ValueType,
+    expected: ?ValueType = null,
+    found: ?ValueType = null,
+    // Severity level
+    severity: Severity = .@"error",
+    // For rank mismatches
+    expected_rank: ?usize = null,
+    found_rank: ?usize = null,
+    tensor_name: ?[]const u8 = null,
+    // For index errors
+    index_name: ?[]const u8 = null,
+    // Cross-reference to original definition
+    original_location: ?tokens.SourceLocation = null,
 };
 
 /// Type environment tracking known tensor types
@@ -185,15 +222,126 @@ pub const TypeChecker = struct {
                 .location = eq.location,
                 .expected = .boolean,
                 .found = .real,
+                .severity = .warning,
             });
         }
 
-        // Register the tensor type
-        try self.env.setTensorType(eq.lhs.name, TensorType{
-            .value_type = lhs_type,
-            .shape = null,
-            .is_sparse = false,
-        });
+        // Check rank consistency and register tensor type
+        try self.checkTensorRank(&eq.lhs);
+
+        // Check indices in RHS expression
+        try self.checkExprRanks(eq.rhs);
+    }
+
+    /// Extract simple name from Index union (returns null for constants/slices)
+    fn getIndexName(idx: ast.Index) ?[]const u8 {
+        return switch (idx) {
+            .name => |n| n,
+            .arithmetic => |a| a.base,
+            .virtual => |v| v,
+            .normalize => |n| n,
+            .primed => |p| p,
+            .div => |d| d.index,
+            .constant, .slice => null,
+        };
+    }
+
+    /// Check tensor reference for consistent rank
+    fn checkTensorRank(self: *TypeChecker, ref: *const ast.TensorRef) !void {
+        const ref_rank = ref.indices.len;
+        const value_type: ValueType = if (ref.is_boolean) .boolean else .real;
+
+        if (self.env.getTensorType(ref.name)) |existing| {
+            // Tensor seen before - check rank consistency
+            if (existing.rank) |expected_rank| {
+                if (ref_rank != expected_rank) {
+                    try self.env.addError(.{
+                        .message = "tensor rank mismatch",
+                        .location = ref.location,
+                        .tensor_name = ref.name,
+                        .expected_rank = expected_rank,
+                        .found_rank = ref_rank,
+                        .original_location = existing.first_defined_at,
+                        .severity = .@"error",
+                    });
+                }
+            } else {
+                // Existing type has no rank info - update it
+                try self.env.setTensorType(ref.name, TensorType{
+                    .value_type = existing.value_type,
+                    .shape = existing.shape,
+                    .is_sparse = existing.is_sparse,
+                    .rank = ref_rank,
+                    .first_defined_at = ref.location,
+                });
+            }
+        } else {
+            // First use - record the type with rank
+            try self.env.setTensorType(ref.name, TensorType.withRank(
+                value_type,
+                ref_rank,
+                ref.location,
+            ));
+        }
+
+        // Check individual indices for validity
+        for (ref.indices) |idx| {
+            try self.checkArithmeticIndex(idx, ref.location);
+        }
+    }
+
+    /// Validate arithmetic index expressions are well-defined
+    fn checkArithmeticIndex(self: *TypeChecker, idx: ast.Index, location: tokens.SourceLocation) !void {
+        switch (idx) {
+            .div => |d| {
+                if (d.divisor <= 0) {
+                    try self.env.addError(.{
+                        .message = "index division by non-positive number",
+                        .location = location,
+                        .index_name = d.index,
+                        .severity = .@"error",
+                    });
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Check ranks recursively in an expression
+    fn checkExprRanks(self: *TypeChecker, expr: *const ast.Expr) !void {
+        switch (expr.*) {
+            .tensor_ref => |ref| {
+                try self.checkTensorRank(&ref);
+            },
+            .binary => |bin| {
+                try self.checkExprRanks(bin.left);
+                try self.checkExprRanks(bin.right);
+            },
+            .unary => |un| {
+                try self.checkExprRanks(un.operand);
+            },
+            .product => |prod| {
+                for (prod.factors) |factor| {
+                    try self.checkExprRanks(factor);
+                }
+            },
+            .nonlinearity => |nl| {
+                try self.checkExprRanks(nl.arg);
+            },
+            .conditional => |cond| {
+                try self.checkExprRanks(cond.condition);
+                try self.checkExprRanks(cond.then_branch);
+                if (cond.else_branch) |else_br| {
+                    try self.checkExprRanks(else_br);
+                }
+            },
+            .group => |g| try self.checkExprRanks(g),
+            .embed => |e| {
+                try self.checkExprRanks(e.embedding);
+                try self.checkExprRanks(e.index);
+            },
+            .literal => {},
+        }
     }
 
     /// Infer the type of an expression
@@ -279,17 +427,53 @@ pub const TypeChecker = struct {
         return self.errors.items;
     }
 
+    /// Count errors by severity
+    pub fn countBySeverity(self: *TypeChecker) struct { errors: usize, warnings: usize } {
+        var errors: usize = 0;
+        var warnings: usize = 0;
+        for (self.env.errors.items) |err| {
+            switch (err.severity) {
+                .@"error" => errors += 1,
+                .warning => warnings += 1,
+                .hint => {},
+            }
+        }
+        return .{ .errors = errors, .warnings = warnings };
+    }
+
     /// Format type errors for display
     pub fn formatErrors(self: *TypeChecker, allocator: std.mem.Allocator) ![]u8 {
-        var result = std.ArrayList(u8).init(allocator);
-        const writer = result.writer();
+        var result = std.ArrayListUnmanaged(u8){};
+        defer result.deinit(allocator);
+        const writer = result.writer(allocator);
 
         for (self.env.errors.items) |err| {
-            try writer.print("{d}:{d}: type warning: {s}\n", .{
+            // Severity prefix
+            try writer.print("{d}:{d}: {s}: {s}\n", .{
                 err.location.line,
                 err.location.column,
+                err.severity.format(),
                 err.message,
             });
+
+            // Tensor name context
+            if (err.tensor_name) |name| {
+                try writer.print("  tensor: {s}\n", .{name});
+            }
+
+            // Index name context
+            if (err.index_name) |name| {
+                try writer.print("  index: {s}\n", .{name});
+            }
+
+            // Rank mismatch details
+            if (err.expected_rank) |expected| {
+                if (err.found_rank) |found| {
+                    try writer.print("  expected rank: {d}, found: {d}\n", .{ expected, found });
+                }
+            }
+
+            // Value type mismatch details
             if (err.expected) |expected| {
                 if (err.found) |found| {
                     try writer.print("  expected: {s}, found: {s}\n", .{
@@ -298,9 +482,14 @@ pub const TypeChecker = struct {
                     });
                 }
             }
+
+            // Cross-reference to original location
+            if (err.original_location) |orig| {
+                try writer.print("  first defined at {d}:{d}\n", .{ orig.line, orig.column });
+            }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(allocator);
     }
 };
 
@@ -399,4 +588,116 @@ test "sigmoid produces real" {
 
     const inferred = try checker.inferExprType(&sigmoid_expr);
     try std.testing.expectEqual(ValueType.real, inferred);
+}
+
+test "rank consistency - same tensor same rank" {
+    const allocator = std.testing.allocator;
+    var checker = TypeChecker.init(allocator);
+    defer checker.deinit();
+
+    // First use at rank 2
+    var indices1 = [_]ast.Index{ .{ .name = "i" }, .{ .name = "j" } };
+    const ref1 = ast.TensorRef{
+        .name = "A",
+        .indices = &indices1,
+        .is_boolean = false,
+        .location = .{ .line = 1, .column = 1, .offset = 0 },
+    };
+    try checker.checkTensorRank(&ref1);
+
+    // Second use also at rank 2 - should be fine
+    var indices2 = [_]ast.Index{ .{ .name = "x" }, .{ .name = "y" } };
+    const ref2 = ast.TensorRef{
+        .name = "A",
+        .indices = &indices2,
+        .is_boolean = false,
+        .location = .{ .line = 2, .column = 1, .offset = 10 },
+    };
+    try checker.checkTensorRank(&ref2);
+
+    // No errors expected
+    try std.testing.expect(!checker.env.hasErrors());
+}
+
+test "rank consistency - same tensor different ranks" {
+    const allocator = std.testing.allocator;
+    var checker = TypeChecker.init(allocator);
+    defer checker.deinit();
+
+    // First use at rank 2
+    var indices1 = [_]ast.Index{ .{ .name = "i" }, .{ .name = "j" } };
+    const ref1 = ast.TensorRef{
+        .name = "A",
+        .indices = &indices1,
+        .is_boolean = false,
+        .location = .{ .line = 1, .column = 1, .offset = 0 },
+    };
+    try checker.checkTensorRank(&ref1);
+
+    // Second use at rank 3 - should produce error
+    var indices2 = [_]ast.Index{ .{ .name = "i" }, .{ .name = "j" }, .{ .name = "k" } };
+    const ref2 = ast.TensorRef{
+        .name = "A",
+        .indices = &indices2,
+        .is_boolean = false,
+        .location = .{ .line = 2, .column = 1, .offset = 10 },
+    };
+    try checker.checkTensorRank(&ref2);
+
+    // Should have error
+    try std.testing.expect(checker.env.hasErrors());
+    try std.testing.expectEqual(@as(usize, 1), checker.env.errors.items.len);
+    const err = checker.env.errors.items[0];
+    try std.testing.expectEqual(@as(?usize, 2), err.expected_rank);
+    try std.testing.expectEqual(@as(?usize, 3), err.found_rank);
+    try std.testing.expectEqual(Severity.@"error", err.severity);
+}
+
+test "arithmetic index - division by zero" {
+    const allocator = std.testing.allocator;
+    var checker = TypeChecker.init(allocator);
+    defer checker.deinit();
+
+    // Division by zero should produce error
+    const div_idx = ast.Index{ .div = .{ .index = "i", .divisor = 0 } };
+    try checker.checkArithmeticIndex(div_idx, .{ .line = 1, .column = 1, .offset = 0 });
+
+    try std.testing.expect(checker.env.hasErrors());
+    try std.testing.expectEqual(Severity.@"error", checker.env.errors.items[0].severity);
+}
+
+test "arithmetic index - valid division" {
+    const allocator = std.testing.allocator;
+    var checker = TypeChecker.init(allocator);
+    defer checker.deinit();
+
+    // Division by positive number should be fine
+    const div_idx = ast.Index{ .div = .{ .index = "i", .divisor = 2 } };
+    try checker.checkArithmeticIndex(div_idx, .{ .line = 1, .column = 1, .offset = 0 });
+
+    try std.testing.expect(!checker.env.hasErrors());
+}
+
+test "error count by severity" {
+    const allocator = std.testing.allocator;
+    var checker = TypeChecker.init(allocator);
+    defer checker.deinit();
+
+    // Add one error
+    try checker.env.addError(.{
+        .message = "test error",
+        .location = .{ .line = 1, .column = 1, .offset = 0 },
+        .severity = .@"error",
+    });
+
+    // Add one warning
+    try checker.env.addError(.{
+        .message = "test warning",
+        .location = .{ .line = 2, .column = 1, .offset = 10 },
+        .severity = .warning,
+    });
+
+    const counts = checker.countBySeverity();
+    try std.testing.expectEqual(@as(usize, 1), counts.errors);
+    try std.testing.expectEqual(@as(usize, 1), counts.warnings);
 }

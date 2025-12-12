@@ -47,6 +47,10 @@ zig build
 ./matmul
 ```
 
+## Project Roadmap
+
+See [ROADMAP.MD](ROADMAP.MD) for prioritized milestones and paper-alignment goals.
+
 ## Language Reference
 
 ### Domains
@@ -59,6 +63,22 @@ domain i: 784
 domain h: 256
 domain o: 10
 ```
+
+### Tensor Types
+
+Two syntaxes distinguish Boolean relations from real-valued tensors:
+
+```
+// Boolean relations use parentheses (Datalog style)
+Parent(x, y)      // Boolean: 0 or 1
+Ancestor(x, z)    // Boolean: 0 or 1
+
+// Real tensors use brackets (standard tensor notation)
+W[i, j]           // Real: any float
+Hidden[b, h]      // Real: any float
+```
+
+This follows the paper's convention where logic programming relations use `()` and neural network weights use `[]`. Both are valid tensor equations—the syntax just hints at the intended value type.
 
 ### Tensor Equations
 
@@ -150,10 +170,21 @@ Ancestor[0, 5]?
 
 ### File I/O
 
+Save and load tensors in binary format (raw 64-bit floats, row-major order):
+
 ```
-save W "weights.bin"
-load W "weights.bin"
+// Save trained weights
+save W1 "model/w1.bin"
+save W2 "model/w2.bin"
+
+// Load weights in another program
+load W1 "model/w1.bin"
+load W2 "model/w2.bin"
 ```
+
+The binary format is simply `N * 8` bytes where N is the tensor's total element count. This is compatible with NumPy's `ndarray.tofile()` / `fromfile()` for interop.
+
+**Note:** Text/CSV ingestion is planned for a future release.
 
 ## Examples
 

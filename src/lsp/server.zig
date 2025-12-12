@@ -49,7 +49,6 @@ pub const LspServer = struct {
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.content);
-            self.allocator.free(entry.value_ptr.uri);
         }
         self.documents.deinit();
 
@@ -199,6 +198,12 @@ pub const LspServer = struct {
         const text = text_doc.object.get("text") orelse return;
         const version = text_doc.object.get("version") orelse return;
 
+        // Check if document already exists (shouldn't happen, but handle gracefully)
+        if (self.documents.fetchRemove(uri.string)) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value.content);
+        }
+
         const uri_copy = try self.allocator.dupe(u8, uri.string);
         const text_copy = try self.allocator.dupe(u8, text.string);
 
@@ -217,6 +222,7 @@ pub const LspServer = struct {
         const text_doc = params.object.get("textDocument") orelse return;
         const uri = text_doc.object.get("uri") orelse return;
         const changes = params.object.get("contentChanges") orelse return;
+        const version = text_doc.object.get("version");
 
         if (changes.array.items.len > 0) {
             const change = changes.array.items[0];
@@ -225,6 +231,9 @@ pub const LspServer = struct {
             if (self.documents.getPtr(uri.string)) |doc| {
                 self.allocator.free(doc.content);
                 doc.content = try self.allocator.dupe(u8, new_text.string);
+                if (version) |v| {
+                    doc.version = v.integer;
+                }
             }
 
             // Publish diagnostics
@@ -240,7 +249,15 @@ pub const LspServer = struct {
         if (self.documents.fetchRemove(uri.string)) |kv| {
             self.allocator.free(kv.key);
             self.allocator.free(kv.value.content);
-            self.allocator.free(kv.value.uri);
+        }
+
+        // Also clean up symbols for this document
+        if (self.symbols.fetchRemove(uri.string)) |kv| {
+            for (kv.value.items) |sym| {
+                self.allocator.free(sym.detail);
+            }
+            var list = kv.value;
+            list.deinit(self.allocator);
         }
     }
 
@@ -553,17 +570,21 @@ pub const LspServer = struct {
     }
 
     fn extractSymbols(self: *LspServer, uri: []const u8, program: *const ast.Program) !void {
+        // Get the document's stored URI (which we own) for use as map key
+        const doc = self.documents.get(uri) orelse return;
+        const stable_uri = doc.uri;
+
         // Clear existing symbols for this document
-        if (self.symbols.getPtr(uri)) |existing| {
+        if (self.symbols.getPtr(stable_uri)) |existing| {
             for (existing.items) |sym| {
                 self.allocator.free(sym.detail);
             }
             existing.clearRetainingCapacity();
         } else {
-            try self.symbols.put(uri, std.ArrayListUnmanaged(SymbolInfo){});
+            try self.symbols.put(stable_uri, std.ArrayListUnmanaged(SymbolInfo){});
         }
 
-        const syms = self.symbols.getPtr(uri).?;
+        const syms = self.symbols.getPtr(stable_uri).?;
 
         for (program.statements) |stmt| {
             switch (stmt) {

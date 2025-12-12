@@ -4,10 +4,17 @@
 // From Section 3 of Pedro Domingos' "Tensor Logic" paper
 //
 // Given a Parent relation, compute all Ancestor pairs
+//
+// Note: The paper uses Datalog-style parentheses for Boolean relations:
+//   Parent(x, y) ← ...
+//   Ancestor(x, z) ← Ancestor(x, y), Parent(y, z)
+// This example uses bracket syntax [x, y] which also works.
+// Parentheses hint "Boolean (0/1)", brackets hint "Real (any float)".
 
 domain p: 10
 
 // Parent relation (sparse - only a few edges)
+// Could also write: sparse Parent(p, p) for Boolean semantics
 sparse Parent[p, p]
 
 // Linear chain: 0 -> 1 -> 2 -> ... -> 9

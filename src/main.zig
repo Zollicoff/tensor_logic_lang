@@ -140,7 +140,18 @@ fn printVersion() !void {
 fn buildFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]const u8) !void {
     // Read source file
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        switch (err) {
+            error.FileNotFound => {
+                std.debug.print("Error: file not found: '{s}'\n", .{path});
+                std.debug.print("Check that the path is correct and the file exists.\n", .{});
+            },
+            error.AccessDenied => {
+                std.debug.print("Error: permission denied: '{s}'\n", .{path});
+            },
+            else => {
+                std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+            },
+        }
         return;
     };
     defer allocator.free(source);
@@ -224,7 +235,12 @@ fn buildFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]con
 
     child.spawn() catch |err| {
         std.debug.print("Error: failed to run clang: {}\n", .{err});
-        std.debug.print("Make sure clang is installed and in your PATH\n", .{});
+        std.debug.print("\nClang is required to build native executables.\n", .{});
+        std.debug.print("Install clang:\n", .{});
+        std.debug.print("  macOS:   xcode-select --install\n", .{});
+        std.debug.print("  Ubuntu:  sudo apt install clang\n", .{});
+        std.debug.print("  Windows: winget install LLVM.LLVM\n", .{});
+        std.debug.print("\nAlternatively, use 'tlc compile' to emit LLVM IR.\n", .{});
         std.fs.deleteFileAbsolute(tmp_ll) catch {};
         return;
     };
@@ -250,7 +266,18 @@ fn compileFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]c
 
     // Read source file
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        switch (err) {
+            error.FileNotFound => {
+                std.debug.print("Error: file not found: '{s}'\n", .{path});
+                std.debug.print("Check that the path is correct and the file exists.\n", .{});
+            },
+            error.AccessDenied => {
+                std.debug.print("Error: permission denied: '{s}'\n", .{path});
+            },
+            else => {
+                std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+            },
+        }
         return;
     };
     defer allocator.free(source);
@@ -313,7 +340,18 @@ fn compileFile(allocator: std.mem.Allocator, path: []const u8, output_path: ?[]c
 
 fn lexFile(allocator: std.mem.Allocator, path: []const u8) !void {
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        switch (err) {
+            error.FileNotFound => {
+                std.debug.print("Error: file not found: '{s}'\n", .{path});
+                std.debug.print("Check that the path is correct and the file exists.\n", .{});
+            },
+            error.AccessDenied => {
+                std.debug.print("Error: permission denied: '{s}'\n", .{path});
+            },
+            else => {
+                std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+            },
+        }
         return;
     };
     defer allocator.free(source);
@@ -337,7 +375,18 @@ fn lexFile(allocator: std.mem.Allocator, path: []const u8) !void {
 
 fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        switch (err) {
+            error.FileNotFound => {
+                std.debug.print("Error: file not found: '{s}'\n", .{path});
+                std.debug.print("Check that the path is correct and the file exists.\n", .{});
+            },
+            error.AccessDenied => {
+                std.debug.print("Error: permission denied: '{s}'\n", .{path});
+            },
+            else => {
+                std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+            },
+        }
         return;
     };
     defer allocator.free(source);
@@ -443,7 +492,18 @@ fn parseFile(allocator: std.mem.Allocator, path: []const u8) !void {
 
 fn checkFile(allocator: std.mem.Allocator, path: []const u8) !void {
     const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
-        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        switch (err) {
+            error.FileNotFound => {
+                std.debug.print("Error: file not found: '{s}'\n", .{path});
+                std.debug.print("Check that the path is correct and the file exists.\n", .{});
+            },
+            error.AccessDenied => {
+                std.debug.print("Error: permission denied: '{s}'\n", .{path});
+            },
+            else => {
+                std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+            },
+        }
         return;
     };
     defer allocator.free(source);
@@ -500,21 +560,30 @@ fn checkFile(allocator: std.mem.Allocator, path: []const u8) !void {
         stdout.writeAll(msg) catch continue;
     }
 
-    // Print any warnings
+    // Print any errors/warnings
     if (checker.env.errors.items.len > 0) {
-        stdout.writeAll("\nType warnings:\n") catch return;
-        for (checker.env.errors.items) |err| {
-            const msg = std.fmt.allocPrint(allocator, "  {s}:{d}:{d}: warning: {s}\n", .{
-                path,
-                err.location.line,
-                err.location.column,
-                err.message,
-            }) catch continue;
-            defer allocator.free(msg);
-            stdout.writeAll(msg) catch continue;
+        stdout.writeAll("\nDiagnostics:\n") catch return;
+
+        // Use enhanced error formatting
+        const formatted = checker.formatErrors(allocator) catch return;
+        defer allocator.free(formatted);
+        stdout.writeAll(formatted) catch return;
+
+        // Print summary
+        const counts = checker.countBySeverity();
+        const summary = std.fmt.allocPrint(allocator, "\n{d} error(s), {d} warning(s)\n", .{
+            counts.errors,
+            counts.warnings,
+        }) catch return;
+        defer allocator.free(summary);
+        stdout.writeAll(summary) catch return;
+
+        // Exit with error if there are hard errors
+        if (counts.errors > 0) {
+            std.process.exit(1);
         }
     } else {
-        stdout.writeAll("\nNo type warnings.\n") catch return;
+        stdout.writeAll("\nNo type errors.\n") catch return;
     }
 }
 

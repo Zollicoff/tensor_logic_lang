@@ -50,6 +50,7 @@ The extension provides highlighting for:
 - **Tensors**: Capitalized names like `X`, `Weight`, `Output`
 - **Indices**: Lowercase names like `i`, `j`, `k`
 - **Special indices**: Virtual (`*t`), primed (`i'`), normalize (`i.`)
+- **Tensor syntax**: `T[i,j]` for real tensors, `T(i,j)` for Boolean relations
 
 ## Language Server Features
 
