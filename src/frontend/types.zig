@@ -43,6 +43,23 @@ pub const Shape = struct {
     }
 };
 
+/// Tracks inferred domain for an index symbol
+/// Used to validate that the same index symbol is used consistently across all tensors
+pub const IndexConstraint = struct {
+    /// Index symbol name (e.g., "i", "x")
+    name: []const u8,
+    /// Domain inferred from tensor position (e.g., "Person" from sparse Parent[Person, Person])
+    inferred_domain: ?[]const u8,
+    /// Size of that domain (e.g., 10 from domain Person: 10)
+    inferred_size: ?usize,
+    /// Source location where first used (for error messages)
+    first_used_at: tokens.SourceLocation,
+    /// Tensor where first seen (for error messages)
+    first_tensor: []const u8,
+    /// Which dimension in that tensor (0-indexed)
+    first_dimension: usize,
+};
+
 /// Type information for a tensor
 pub const TensorType = struct {
     value_type: ValueType,
@@ -105,6 +122,11 @@ pub const TypeError = struct {
     index_name: ?[]const u8 = null,
     // Cross-reference to original definition
     original_location: ?tokens.SourceLocation = null,
+    // For domain/size errors (M1.1)
+    expected_domain: ?[]const u8 = null,
+    found_domain: ?[]const u8 = null,
+    expected_size: ?usize = null,
+    found_size: ?usize = null,
 };
 
 /// Type environment tracking known tensor types
@@ -114,6 +136,8 @@ pub const TypeEnv = struct {
     tensor_types: std.StringHashMap(TensorType),
     /// Maps domain names to their sizes
     domain_sizes: std.StringHashMap(usize),
+    /// Tracks index symbol constraints (M1.1 - validates consistent domain usage)
+    index_constraints: std.StringHashMap(IndexConstraint),
     /// Collected type errors
     errors: std.ArrayListUnmanaged(TypeError),
 
@@ -122,6 +146,7 @@ pub const TypeEnv = struct {
             .allocator = allocator,
             .tensor_types = std.StringHashMap(TensorType).init(allocator),
             .domain_sizes = std.StringHashMap(usize).init(allocator),
+            .index_constraints = std.StringHashMap(IndexConstraint).init(allocator),
             .errors = std.ArrayListUnmanaged(TypeError){},
         };
     }
@@ -129,6 +154,7 @@ pub const TypeEnv = struct {
     pub fn deinit(self: *TypeEnv) void {
         self.tensor_types.deinit();
         self.domain_sizes.deinit();
+        self.index_constraints.deinit();
         self.errors.deinit(self.allocator);
     }
 
@@ -146,6 +172,63 @@ pub const TypeEnv = struct {
 
     pub fn getDomainSize(self: *TypeEnv, name: []const u8) ?usize {
         return self.domain_sizes.get(name);
+    }
+
+    /// Get an existing index constraint
+    pub fn getIndexConstraint(self: *TypeEnv, name: []const u8) ?IndexConstraint {
+        return self.index_constraints.get(name);
+    }
+
+    /// Record use of an index symbol and validate consistency
+    /// If the same index was used before with a different size, emit an error
+    pub fn recordIndexUse(
+        self: *TypeEnv,
+        index_name: []const u8,
+        domain: ?[]const u8,
+        size: ?usize,
+        tensor_name: []const u8,
+        dimension: usize,
+        location: tokens.SourceLocation,
+    ) !void {
+        if (self.index_constraints.getPtr(index_name)) |existing| {
+            // Index already seen - validate consistency
+            if (existing.inferred_size) |existing_size| {
+                if (size) |new_size| {
+                    if (existing_size != new_size) {
+                        // Inconsistent use - same index symbol used with different sizes
+                        try self.addError(.{
+                            .message = "index used with inconsistent domain sizes",
+                            .location = location,
+                            .severity = .@"error",
+                            .index_name = index_name,
+                            .tensor_name = tensor_name,
+                            .expected_size = existing_size,
+                            .found_size = new_size,
+                            .expected_domain = existing.inferred_domain,
+                            .found_domain = domain,
+                            .original_location = existing.first_used_at,
+                        });
+                    }
+                }
+            } else if (size != null) {
+                // Existing had no size but we now have one - update the constraint
+                existing.inferred_size = size;
+                existing.inferred_domain = domain;
+                existing.first_used_at = location;
+                existing.first_tensor = tensor_name;
+                existing.first_dimension = dimension;
+            }
+        } else {
+            // First use of this index - record the constraint
+            try self.index_constraints.put(index_name, .{
+                .name = index_name,
+                .inferred_domain = domain,
+                .inferred_size = size,
+                .first_used_at = location,
+                .first_tensor = tensor_name,
+                .first_dimension = dimension,
+            });
+        }
     }
 
     pub fn addError(self: *TypeEnv, err: TypeError) !void {
@@ -184,11 +267,29 @@ pub const TypeChecker = struct {
                     }
                 },
                 .sparse_decl => |s| {
-                    // Sparse declarations define Boolean relations
+                    // Sparse declarations define Boolean relations with explicit domain info
+                    // Build shape from declared domains
+                    var domains = try self.allocator.alloc([]const u8, s.indices.len);
+                    var sizes = try self.allocator.alloc(?usize, s.indices.len);
+
+                    for (s.indices, 0..) |idx_decl, i| {
+                        // Use declared domain if present, otherwise use index name
+                        const domain_name = idx_decl.domain orelse idx_decl.name;
+                        domains[i] = domain_name;
+                        sizes[i] = self.env.getDomainSize(domain_name);
+                    }
+
+                    const shape = Shape{
+                        .domains = domains,
+                        .sizes = sizes,
+                    };
+
                     try self.env.setTensorType(s.name, TensorType{
                         .value_type = if (s.is_boolean) .boolean else .real,
-                        .shape = null,
+                        .shape = shape,
                         .is_sparse = true,
+                        .rank = s.indices.len,
+                        .first_defined_at = s.location,
                     });
                 },
                 else => {},
@@ -246,12 +347,15 @@ pub const TypeChecker = struct {
         };
     }
 
-    /// Check tensor reference for consistent rank
+    /// Check tensor reference for consistent rank and record index uses
     fn checkTensorRank(self: *TypeChecker, ref: *const ast.TensorRef) !void {
         const ref_rank = ref.indices.len;
         const value_type: ValueType = if (ref.is_boolean) .boolean else .real;
 
-        if (self.env.getTensorType(ref.name)) |existing| {
+        // Get existing tensor type (may have shape from sparse_decl)
+        const existing_type = self.env.getTensorType(ref.name);
+
+        if (existing_type) |existing| {
             // Tensor seen before - check rank consistency
             if (existing.rank) |expected_rank| {
                 if (ref_rank != expected_rank) {
@@ -284,9 +388,39 @@ pub const TypeChecker = struct {
             ));
         }
 
-        // Check individual indices for validity
-        for (ref.indices) |idx| {
+        // Check individual indices for validity and record index uses
+        for (ref.indices, 0..) |idx, dim| {
             try self.checkArithmeticIndex(idx, ref.location);
+
+            // Record index use for domain tracking (M1.1)
+            if (idx.getBaseName()) |index_name| {
+                // Try to get domain info from tensor's shape (if available)
+                var domain: ?[]const u8 = null;
+                var size: ?usize = null;
+
+                if (existing_type) |existing| {
+                    if (existing.shape) |shape| {
+                        if (dim < shape.domains.len) {
+                            domain = shape.domains[dim];
+                            size = shape.sizes[dim];
+                        }
+                    }
+                }
+
+                // If no size from shape, try fallback to domain lookup by index name
+                if (size == null) {
+                    size = self.env.getDomainSize(index_name);
+                }
+
+                try self.env.recordIndexUse(
+                    index_name,
+                    domain,
+                    size,
+                    ref.name,
+                    dim,
+                    ref.location,
+                );
+            }
         }
     }
 
@@ -480,6 +614,22 @@ pub const TypeChecker = struct {
                         expected.format(),
                         found.format(),
                     });
+                }
+            }
+
+            // Domain size mismatch details (M1.1)
+            if (err.expected_size) |expected| {
+                if (err.found_size) |found| {
+                    try writer.print("  expected size: {d}, found: {d}\n", .{ expected, found });
+                }
+            }
+
+            // Domain name mismatch details (M1.1)
+            if (err.expected_domain) |expected| {
+                if (err.found_domain) |found| {
+                    try writer.print("  expected domain: {s}, found: {s}\n", .{ expected, found });
+                } else {
+                    try writer.print("  expected domain: {s}\n", .{expected});
                 }
             }
 

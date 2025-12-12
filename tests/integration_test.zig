@@ -83,6 +83,22 @@ const test_cases = [_]TestCase{
         .file = "tests/semantic/rank_consistent.tl",
         .mode = .check_only,
     },
+    // M1.1: Index consistency tests
+    .{
+        .name = "index_consistent",
+        .file = "tests/semantic/index_consistent.tl",
+        .mode = .check_only,
+    },
+    .{
+        .name = "index_inconsistent",
+        .file = "tests/semantic/index_inconsistent.tl",
+        .mode = .check_expect_error,
+    },
+    .{
+        .name = "index_matmul",
+        .file = "tests/semantic/index_matmul.tl",
+        .mode = .check_only,
+    },
 };
 
 pub fn main() !void {

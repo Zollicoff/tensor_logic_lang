@@ -86,14 +86,16 @@ Deliverable: backward-chaining mode that users can rely on for "query only what'
 
 Goal: add domain-aware shape inference once basic checks are solid.
 
-- [ ] **Domain-aware index checking**
-  - [ ] Track domain for each index symbol within a scope and reject inconsistent reuse.
-  - [ ] Infer missing domain sizes where possible (or require explicit `domain` declarations).
-- [ ] **Tensor shape inference**
-  - [ ] Infer tensor shapes from LHS indices + domain declarations.
-  - [ ] Propagate shape requirements through RHS tensor references.
-- [ ] **Better errors (shape-centric)**
-  - [ ] Report expected vs found shapes/domains with locations.
+- [x] **Domain-aware index checking**
+  - [x] Track domain for each index symbol within a scope and reject inconsistent reuse.
+  - [ ] *Deferred*: Infer missing domain sizes (currently falls back to default 10 with warning).
+- [x] **Tensor shape inference**
+  - [x] Infer tensor shapes from sparse/tucker declarations + domain declarations.
+  - [x] Propagate shape requirements through RHS tensor references (validates index consistency).
+- [x] **Better errors (shape-centric)**
+  - [x] Report expected vs found sizes/domains with cross-reference locations.
+
+**Status**: Core index consistency checking complete. Same index symbol used with different domain sizes is now a hard error.
 
 ---
 

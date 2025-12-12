@@ -66,6 +66,20 @@ pub const Index = union(enum) {
             .div => |d| std.fmt.allocPrint(allocator, "{s}/{d}", .{ d.index, d.divisor }),
         };
     }
+
+    /// Extract the base index name from any index variant
+    /// Returns null for constants and slices (which don't have symbolic names)
+    pub fn getBaseName(self: Index) ?[]const u8 {
+        return switch (self) {
+            .name => |n| n,
+            .arithmetic => |a| a.base,
+            .virtual => |v| v,
+            .normalize => |n| n,
+            .primed => |p| p,
+            .div => |d| d.index,
+            .constant, .slice => null,
+        };
+    }
 };
 
 // ============================================================================
