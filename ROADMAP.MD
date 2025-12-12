@@ -88,14 +88,19 @@ Goal: add domain-aware shape inference once basic checks are solid.
 
 - [x] **Domain-aware index checking**
   - [x] Track domain for each index symbol within a scope and reject inconsistent reuse.
-  - [ ] *Deferred*: Infer missing domain sizes (currently falls back to default 10 with warning).
+  - [x] Warn when index domain is inferred from name (not tensor position).
+  - [x] Warn when same index used with different domain names (even if sizes match).
+  - [ ] *Deferred*: Infer missing domain sizes (currently falls back to default 10).
 - [x] **Tensor shape inference**
   - [x] Infer tensor shapes from sparse/tucker declarations + domain declarations.
   - [x] Propagate shape requirements through RHS tensor references (validates index consistency).
 - [x] **Better errors (shape-centric)**
   - [x] Report expected vs found sizes/domains with cross-reference locations.
 
-**Status**: Core index consistency checking complete. Same index symbol used with different domain sizes is now a hard error.
+**Status**: Core index consistency checking complete.
+- **Error**: Same index symbol used with different domain sizes.
+- **Warning**: Index domain inferred from name (name-based coupling made visible).
+- **Warning**: Same index used with different domain names (sizes match but semantics may differ).
 
 ---
 
