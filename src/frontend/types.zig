@@ -181,6 +181,7 @@ pub const TypeEnv = struct {
 
     /// Record use of an index symbol and validate consistency
     /// If the same index was used before with a different size, emit an error
+    /// If the same index was used with a different domain name (but same size), emit a warning
     pub fn recordIndexUse(
         self: *TypeEnv,
         index_name: []const u8,
@@ -208,6 +209,30 @@ pub const TypeEnv = struct {
                             .found_domain = domain,
                             .original_location = existing.first_used_at,
                         });
+                    } else {
+                        // Sizes match - but check if domain names differ
+                        const domains_differ = blk: {
+                            if (existing.inferred_domain) |existing_dom| {
+                                if (domain) |new_dom| {
+                                    break :blk !std.mem.eql(u8, existing_dom, new_dom);
+                                }
+                            }
+                            break :blk false;
+                        };
+                        if (domains_differ) {
+                            try self.addError(.{
+                                .message = "index used with different domains (sizes match but semantics may differ)",
+                                .location = location,
+                                .severity = .warning,
+                                .index_name = index_name,
+                                .tensor_name = tensor_name,
+                                .expected_size = existing_size,
+                                .found_size = new_size,
+                                .expected_domain = existing.inferred_domain,
+                                .found_domain = domain,
+                                .original_location = existing.first_used_at,
+                            });
+                        }
                     }
                 }
             } else if (size != null) {
@@ -408,8 +433,20 @@ pub const TypeChecker = struct {
                 }
 
                 // If no size from shape, try fallback to domain lookup by index name
+                // This is "name-based coupling" - emit a warning to make it visible
                 if (size == null) {
-                    size = self.env.getDomainSize(index_name);
+                    if (self.env.getDomainSize(index_name)) |fallback_size| {
+                        size = fallback_size;
+                        domain = index_name; // Mark that domain came from name matching
+                        try self.env.addError(.{
+                            .message = "index domain inferred from name (not tensor position)",
+                            .location = ref.location,
+                            .severity = .warning,
+                            .index_name = index_name,
+                            .tensor_name = ref.name,
+                            .expected_size = fallback_size,
+                        });
+                    }
                 }
 
                 try self.env.recordIndexUse(

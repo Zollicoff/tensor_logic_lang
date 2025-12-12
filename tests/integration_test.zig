@@ -99,6 +99,11 @@ const test_cases = [_]TestCase{
         .file = "tests/semantic/index_matmul.tl",
         .mode = .check_only,
     },
+    .{
+        .name = "index_domain_mismatch",
+        .file = "tests/semantic/index_domain_mismatch.tl",
+        .mode = .check_only, // Produces warning, not error
+    },
 };
 
 pub fn main() !void {
